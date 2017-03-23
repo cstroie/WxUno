@@ -207,7 +207,7 @@ void aprsSendTelemetry(int vcc, int rssi, int heap, unsigned int luxVis, unsigne
 void aprsSendTelemetrySetup() {
   char sep = ':';
   char padCallSign[10];
-  sprintf(padCallSign, "%9s", APRS_CALLSIGN);
+  sprintf(padCallSign, "%-9s", APRS_CALLSIGN);
   // Parameter names
   aprsSendHeader(sep);
   APRS_Client.print(padCallSign);
