@@ -1,22 +1,22 @@
 /**
-  WxSta - Weather Station
+  WxUno - Weather Station for Arduino UNO
 
   Copyright 2017 Costin STROIE <costinstroie@eridu.eu.org>
 
   This file is part of Weather Station.
 
-  WxSta is free software: you can redistribute it and/or modify
+  WxUno is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by the Free
   Software Foundation, either version 3 of the License, or (at your option) any
   later version.
 
-  WxSta is distributed in the hope that it will be useful, but
+  WxUno is distributed in the hope that it will be useful, but
   WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
   FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
   more details.
 
   You should have received a copy of the GNU General Public License along with
-  WxSta.  If not, see <http://www.gnu.org/licenses/>.
+  WxUno.  If not, see <http://www.gnu.org/licenses/>.
 
 
   WiFi connected weather station, reading the athmospheric sensor BME280 and
@@ -45,8 +45,9 @@
 #undef RUNNING_MEDIAN_ALL
 
 // Device name
-char NODENAME[] = "WxUno";
-char VERSION[] = "0.1";
+char *NODENAME = "WxUno";
+char *VERSION = "0.2";
+bool  PROBE = true;    // True if the station is being probed
 
 // Ethernet
 // assign a MAC address for the ethernet controller.
@@ -56,45 +57,66 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 IPAddress ip(192, 168, 0, 177);
 
 // NTP
-const int TZ = 0;
+const int   TZ = 0;
 const char *NTP_SERVER = "europe.pool.ntp.org";
-const int  NTP_PACKET_SIZE = 48;
+const int   NTP_PACKET_SIZE = 48;
 byte packetBuffer[NTP_PACKET_SIZE];
 unsigned int ntpLocalPort = 8888;
 EthernetUDP UDP;
 
 // APRS parameters
-const char *APRS_SERVER = "cwop5.aprs.net";
-const int  APRS_PORT = 14580;
-const char *APRS_CALLSIGN = "FW0727";
-const int  APRS_PASSCODE = -1;
-const char *APRS_LOCATION = "4455.29N/02527.08E";
-const int  ALTI = 282; // meters
-float ALTI_CORR = pow((float)(1.0 - 2.25577e-5 * ALTI), (float)(-5.25588));
-long ALTIF = (long)(ALTI * 3.28084);
-const byte APRS_SNS_MAX = 5; // x SNS_DELAY
-byte APRS_SNS_COUNT = 0;
-unsigned int aprsSeq = 0;
+const char *aprsServer = "cwop5.aprs.net";
+const int   aprsPort = 14580;
+const char *aprsCallSign = "FW0727";
+const char *aprsPassCode = "-1";
+const char *aprsLocation = "4455.29N/02527.08E_";
+const char *aprsPath = ">APRS,TCPIP*:";
+const int   altMeters = 282;
+const long  altFeet = (long)(altMeters * 3.28084);
+float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25588));
+char  aprsTlmBits = B00000000;   // Telemetry bits
+// Reports and measurements
+const int   aprsRprtHour = 10;  // Number of APRS reports per hour
+const int   aprsMsrmMax = 5;    // Number of measurements per report (keep even)
+int         aprsMsrmCount = 0;  // Measurements counter
+int         aprsTlmSeq = 0;     // Telemetry sequence mumber
+// The APRS connection client
 EthernetClient APRS_Client;
 
 // Statistics
-RunningMedian rmTemp = RunningMedian(APRS_SNS_MAX);
-RunningMedian rmHmdt = RunningMedian(APRS_SNS_MAX);
-RunningMedian rmPres = RunningMedian(APRS_SNS_MAX);
-RunningMedian rmVcc  = RunningMedian(APRS_SNS_MAX);
-RunningMedian rmRSSI = RunningMedian(APRS_SNS_MAX);
-RunningMedian rmHeap = RunningMedian(APRS_SNS_MAX);
+RunningMedian rmTemp = RunningMedian(aprsMsrmMax);
+RunningMedian rmHmdt = RunningMedian(aprsMsrmMax);
+RunningMedian rmPres = RunningMedian(aprsMsrmMax);
+RunningMedian rmVcc  = RunningMedian(aprsMsrmMax);
+RunningMedian rmRSSI = RunningMedian(aprsMsrmMax);
+RunningMedian rmHeap = RunningMedian(aprsMsrmMax);
 
 // Sensors
-const unsigned long SNS_DELAY = 60UL * 1000UL;
-unsigned long SNS_NEXT = 0UL;
-BME280 atmo;
-bool atmo_ok = false;
+const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
+unsigned long snsNextTime = 0UL;  // The next time to read the sensors
+BME280 atmo;                      // The athmospheric sensor
+bool atmo_ok = false;             // The athmospheric sensor flag
+
+void aprsSend(const char *pkt) {
+  APRS_Client.println(pkt);
+#ifdef DEBUG
+  Serial.print(F("APRS: "));
+  Serial.println(pkt);
+#endif
+}
 
 void aprsSendHeader(char sep) {
-  APRS_Client.print(APRS_CALLSIGN);
+  APRS_Client.print(aprsCallSign);
   APRS_Client.print(F(">APRS,TCPIP*:"));
   APRS_Client.print(sep);
+}
+
+char *aprsHeader(const char *sep) {
+  char pkt[30];
+  strcat(pkt, aprsCallSign);
+  strcat(pkt, aprsPath);
+  strcat(pkt, sep);
+  return pkt;
 }
 
 /**
@@ -103,28 +125,30 @@ void aprsSendHeader(char sep) {
 char *aprsTime() {
   time_t moment = now();
   char buf[8];
-  sprintf(buf, "%02d%02d%02dz", day(moment), hour(moment), minute(moment));
+  sprintf_P(buf, PSTR("%02d%02d%02dz"), day(moment), hour(moment), minute(moment));
   return buf;
 }
 
 /**
   Send APRS authentication data
-  user FW0690 pass -1 vers WxSta 0.2"
+  user FW0690 pass -1 vers WxUno 0.2"
 */
 void aprsAuthenticate() {
-  APRS_Client.print(F("user "));
-  APRS_Client.print(APRS_CALLSIGN);
-  APRS_Client.print(F(" pass "));
-  APRS_Client.print(APRS_PASSCODE);
-  APRS_Client.print(F(" vers "));
-  APRS_Client.print(NODENAME);
-  APRS_Client.print(F(" "));
-  APRS_Client.println(VERSION);
+  char pkt[50] = "";
+  strcat_P(pkt, PSTR("user "));
+  strcat(pkt, aprsCallSign);
+  strcat_P(pkt, PSTR(" pass "));
+  strcat(pkt, aprsPassCode);
+  strcat_P(pkt, PSTR(" vers "));
+  strcat(pkt, NODENAME);
+  strcat_P(pkt, PSTR(" "));
+  strcat(pkt, VERSION);
+  aprsSend(pkt);
 }
 
 /**
   Send APRS weather data, then try to get the forecast
-  FW0690>APRS,TCPIP*:@152457h4427.67N/02608.03E_.../...g...t044h86b10201L001WxSta
+  FW0690>APRS,TCPIP*:@152457h4427.67N/02608.03E_.../...g...t044h86b10201L001WxUno
 
   @param temp temperature
   @param hmdt humidity
@@ -137,9 +161,9 @@ void aprsSendWeather(float temp, float hmdt, float pres, float lux) {
   aprsSendHeader('@');
   // Compose the APRS packet
   APRS_Client.print(aprsTime());
-  APRS_Client.print(APRS_LOCATION);
+  APRS_Client.print(aprsLocation);
   // Wind
-  APRS_Client.print(F("_.../...g..."));
+  APRS_Client.print(F(".../...g..."));
   // Temperature
   if (temp >= -273.15) {
     char buf[5];
@@ -189,44 +213,55 @@ void aprsSendWeather(float temp, float hmdt, float pres, float lux) {
 */
 void aprsSendTelemetry(int vcc, int rssi, int heap, unsigned int luxVis, unsigned int luxIrd, byte bits) {
   // Increment the telemetry sequence number, reset it if exceeds 999
-  aprsSeq += 1;
-  if (aprsSeq > 999) aprsSeq = 0;
-  // Send the setup, if the sequence number is 0
-  if (aprsSeq == 260) aprsSendTelemetrySetup();
+  if (++aprsTlmSeq > 999) aprsTlmSeq = 0;
+  // Send the telemetry setup on power up (first 5 minutes) or if the sequence number is 0
+  if ((aprsTlmSeq == 0) or (millis() < 300000UL)) aprsSendTelemetrySetup();
   // Compose the APRS packet
-  aprsSendHeader('T');
+  char pkt[60];
+  strcpy(pkt, aprsHeader("T"));
   char buf[40];
-  sprintf(buf, "#%03d,%03d,%03d,%03d,%03d,%03d,", aprsSeq, (int)((vcc - 2500) / 4), -rssi, (int)(heap / 200), luxVis, luxIrd);
-  APRS_Client.print(buf);
-  APRS_Client.println(F("00000000"));
+  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, (int)((vcc - 2500) / 4), -rssi, (int)(heap / 200), luxVis, luxIrd);
+  strcat(pkt, buf);
+  char bbuf[10];
+  itoa(bits, bbuf, 2);
+  strcat(pkt, bbuf);
+  aprsSend(pkt);
 }
 
 /**
   Send APRS telemetry setup
 */
 void aprsSendTelemetrySetup() {
-  char sep = ':';
   char padCallSign[10];
-  sprintf(padCallSign, "%-9s", APRS_CALLSIGN);
+  sprintf(padCallSign, "%-9s", aprsCallSign);
+  char pkt[120];
+  const char *hdr = aprsHeader(":");
   // Parameter names
-  aprsSendHeader(sep);
-  APRS_Client.print(padCallSign);
-  APRS_Client.println(F(":PARM.Vcc,RSSI,Heap,Temp,NA,B1,B2,B3,B4,B5,B6,B7,B8"));
+  strcpy(pkt, hdr);
+  strcat(pkt, padCallSign);
+  strcat_P(pkt, PSTR(":PARM.Vcc,RSSI,Heap,Temp,NA,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
+  aprsSend(pkt);
   // Equations
-  aprsSendHeader(sep);
-  APRS_Client.print(padCallSign);
-  APRS_Client.println(F(":EQNS.0,0.004,2.5,0,-1,0,0,200,0,0,1,0,0,1,0"));
+  hdr = aprsHeader(":");
+  strcpy(pkt, hdr);
+  strcat(pkt, padCallSign);
+  strcat_P(pkt, PSTR(":EQNS.0,0.004,2.5,0,-1,0,0,200,0,0,1,0,0,1,0"));
+  aprsSend(pkt);
   // Units
-  aprsSendHeader(sep);
-  APRS_Client.print(padCallSign);
-  APRS_Client.println(F(":UNIT.V,dBm,Bytes,C,units,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A"));
+  hdr = aprsHeader(":");
+  strcpy(pkt, hdr);
+  strcat(pkt, padCallSign);
+  strcat_P(pkt, PSTR(":UNIT.V,dBm,Bytes,C,units,prb,on,on,sat,low,N/A,N/A,N/A"));
+  aprsSend(pkt);
   // Bit sense and project name
-  aprsSendHeader(sep);
-  APRS_Client.print(padCallSign);
-  APRS_Client.print(F(":BITS.11111111, "));
-  APRS_Client.print(NODENAME);
-  APRS_Client.print(F("/"));
-  APRS_Client.println(VERSION);
+  hdr = aprsHeader(":");
+  strcpy(pkt, hdr);
+  strcat(pkt, padCallSign);
+  strcat_P(pkt, PSTR(":BITS.10011111, "));
+  strcat(pkt, NODENAME);
+  strcat_P(pkt, PSTR("/"));
+  strcat(pkt, VERSION);
+  aprsSend(pkt);
 }
 
 /**
@@ -253,10 +288,10 @@ void aprsSendStatus(const char *message) {
 void aprsSendPosition(const char *comment) {
   // Compose the APRS packet
   aprsSendHeader('!');
-  APRS_Client.print(APRS_LOCATION);
+  APRS_Client.print(aprsLocation);
   APRS_Client.print(F("/000/000/A="));
   char buf[7];
-  sprintf(buf, "%06d", ALTIF);
+  sprintf(buf, "%06d", altFeet);
   APRS_Client.print(buf);
   APRS_Client.println(comment);
 }
@@ -343,6 +378,7 @@ void setup() {
   Serial.println();
   Serial.begin(9600);
   Serial.println(NODENAME);
+  Serial.println(__DATE__);
 
   // Start the Ethernet connection:
   if (Ethernet.begin(mac) == 0) {
@@ -380,20 +416,21 @@ void setup() {
 
   // Initialize the random number generator and set the APRS telemetry start sequence
   if (timeStatus() != timeNotSet) randomSeed(now());
-  aprsSeq = random(1000);
+  aprsTlmSeq = random(1000);
 
   // Start the sensor timer
-  SNS_NEXT = millis() + SNS_DELAY;
+  snsNextTime = millis() + snsDelay;
 }
 
 void loop() {
   // Read the sensors and publish telemetry
-  if (millis() >= SNS_NEXT) {
+  if (millis() >= snsNextTime) {
     // Check the DHCP lease
     Ethernet.maintain();
-    // Check if we need to send the APRS data
-    APRS_SNS_COUNT++;
-    if (APRS_SNS_COUNT > APRS_SNS_MAX) APRS_SNS_COUNT = 1;
+    // Count to check if we need to send the APRS data
+    if (++aprsMsrmCount > aprsMsrmMax) aprsMsrmCount = 1;
+    // Set the telemetry bit 7 if the station is being probed
+    if (PROBE) aprsTlmBits = B10000000;
 
     // Read BME280
     float temp, pres, slvl, hmdt, dewp;
@@ -401,7 +438,7 @@ void loop() {
       // Get the weather parameters
       temp = atmo.readTempC();
       pres = atmo.readFloatPressure();
-      slvl = pres * ALTI_CORR;
+      slvl = pres * altCorr;
       hmdt = atmo.readFloatHumidity();
       dewp = 243.04 * (log(hmdt / 100.0) + ((17.625 * temp) / (243.04 + temp))) / (17.625 - log(hmdt / 100.0) - ((17.625 * temp) / (243.04 + temp)));
       // Running Median
@@ -421,24 +458,25 @@ void loop() {
     rmRSSI.add(rssi);
     rmHeap.add(heap);
 
-    // APRS (after the first minute, then every APRS_SNS_MAX minutes)
-    if (APRS_SNS_COUNT == 1) {
-      if (APRS_Client.connect(APRS_SERVER, APRS_PORT)) {
-        //Serial.print(F("Connected to "));
-        //Serial.println(APRS_SERVER);
+    // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
+    //       then every 60/aprsRprtHour minutes)
+    if (aprsMsrmCount == 1) {
+      if (APRS_Client.connect(aprsServer, aprsPort)) {
+        Serial.print(F("Connected to "));
+        Serial.println(aprsServer);
         aprsAuthenticate();
-        //aprsSendPosition(" WxStaProbe");
-        if (atmo_ok) {
-          aprsSendWeather(rmTemp.getMedian(), rmHmdt.getMedian(), rmPres.getMedian(), -1);
-        }
+        //aprsSendPosition(" WxUnoProbe");
+        if (atmo_ok) aprsSendWeather(rmTemp.getMedian(), rmHmdt.getMedian(), rmPres.getMedian(), -1);
         aprsSendWeather(rmTemp.getMedian(), -1, -1, -1);
-        aprsSendTelemetry(rmVcc.getMedian(), rmRSSI.getMedian(), rmHeap.getMedian(), 0, 0, 0);
+        aprsSendTelemetry(rmVcc.getMedian(), rmRSSI.getMedian(), rmHeap.getMedian(), 0, 0, aprsTlmBits);
+        //aprsSendStatus("Fine weather");
+        //aprsSendTelemetrySetup();
         APRS_Client.stop();
       }
       else Serial.println(F("Connection failed"));
     }
 
     // Repeat sensor reading
-    SNS_NEXT = SNS_NEXT + SNS_DELAY;
+    snsNextTime += snsDelay;
   }
 }
