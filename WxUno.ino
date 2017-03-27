@@ -71,7 +71,7 @@ const int   altMeters = 83; // 282
 const long  altFeet = (long)(altMeters * 3.28084);
 float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25578));
 // Reports and measurements
-const int   aprsRprtHour = 10;  // Number of APRS reports per hour
+const int   aprsRprtHour = 15;  // Number of APRS reports per hour
 const int   aprsMsrmMax = 3;    // Number of measurements per report (keep even)
 int         aprsMsrmCount = 0;  // Measurements counter
 int         aprsTlmSeq = 0;     // Telemetry sequence mumber
@@ -83,10 +83,10 @@ EthernetClient APRS_Client;
 // Statistics (median filter for the last 3 values)
 int rmTemp[4];
 int rmPres[4];
-int  rmVcc[4];
-int rmRSSI[4];
-int rmHeap[4];
-int  rmMCU[4];
+int rmA0[4];
+int rmA1[4];
+int rmA2[4];
+int rmMCU[4];
 
 // Sensors
 const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
@@ -233,15 +233,15 @@ void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
   @param luxIrd raw infrared illuminance
   @bits digital inputs
 */
-void aprsSendTelemetry(int vcc, int rssi, int heap, unsigned int luxVis, unsigned int luxIrd, byte bits) {
+void aprsSendTelemetry(int a0, int a1, int a2, int a3, int temp, byte bits) {
   // Increment the telemetry sequence number, reset it if exceeds 999
   if (++aprsTlmSeq > 999) aprsTlmSeq = 0;
   // Send the telemetry setup on power up (first minutes) or if the sequence number is 0
-  if ((aprsTlmSeq == 0) or (millis() < snsDelay)) aprsSendTelemetrySetup();
+  if ((aprsTlmSeq == 0) or (millis() < snsDelay + snsDelay)) aprsSendTelemetrySetup();
   // Compose the APRS packet
   aprsSendHeader("T");
   char buf[40];
-  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, (int)((vcc - 2500) / 4), -rssi, (int)(heap / 200), luxVis, luxIrd);
+  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, (int)(a0 / 4), (int)(a1 / 4), (int)(a2 / 4), a3, temp);
   aprsSend(buf);
   char bbuf[10];
   itoa(bits, bbuf, 2);
@@ -258,17 +258,17 @@ void aprsSendTelemetrySetup() {
   // Parameter names
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":PARM.Vcc,RSSI,Heap,Temp,A5,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
+  aprsSend(F(":PARM.LDR,Thrm,Vcc,A3,Temp,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
   aprsSendCRLF();
   // Equations
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":EQNS.0,0.004,2.5,0,-1,0,0,200,0,0,1,0,0,1,0"));
+  aprsSend(F(":EQNS.0,4,0,0,4,0,0,4,0,0,1,0,0,1,0"));
   aprsSendCRLF();
   // Units
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":UNIT.V,dBm,Bytes,C,N/A,prb,on,on,sat,low,N/A,N/A,N/A"));
+  aprsSend(F(":UNIT.lux,C,V,N/A,C,prb,on,on,sat,low,N/A,N/A,N/A"));
   aprsSendCRLF();
   // Bit sense and project name
   aprsSendHeader(":");
@@ -462,18 +462,18 @@ void loop() {
     }
 
     // Various telemetry
-    int rssi = -(analogRead(A0) / 4);
-    int heap = analogRead(A1) / 4;
-    int vcc  = analogRead(A2) / 4;
-    if (vcc < 3000) {
+    int a0 = analogRead(A0);
+    int a1 = analogRead(A1);
+    int a2 = analogRead(A2);
+    if (a2 < 512) {
       // Set the bit 3 to show the battery is low
       aprsTlmBits |= B00001000;
     }
     // Median Filter
-    mdnIn(rmVcc,  vcc);
-    mdnIn(rmRSSI, rssi);
-    mdnIn(rmHeap, heap);
-    mdnIn(rmMCU,  getMCUTemp());
+    mdnIn(rmA0, a0);
+    mdnIn(rmA1, a1);
+    mdnIn(rmA2, a2);
+    mdnIn(rmMCU, getMCUTemp());
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
@@ -485,7 +485,7 @@ void loop() {
         //aprsSendPosition(" WxUnoProbe");
         if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), -1);
         //aprsSendWeather(rmTemp.out(), -1, -1, -1);
-        aprsSendTelemetry(mdnOut(rmVcc), mdnOut(rmRSSI), mdnOut(rmHeap), mdnOut(rmMCU), 0, aprsTlmBits);
+        aprsSendTelemetry(mdnOut(rmA0), mdnOut(rmA1), mdnOut(rmA2), 0, mdnOut(rmMCU), aprsTlmBits);
         //aprsSendStatus("Fine weather");
         //aprsSendTelemetrySetup();
         APRS_Client.stop();
