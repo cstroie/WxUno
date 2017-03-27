@@ -41,9 +41,7 @@
 #include <TimeLib.h>
 
 // Statistics
-#undef RUNNING_MEDIAN_ALL
-#include <RunningMedian.h>
-#undef RUNNING_MEDIAN_ALL
+#include <MedianFilter.h>
 
 // Device name
 char *NODENAME = "WxUno";
@@ -84,12 +82,12 @@ int         aprsTlmSeq = 0;     // Telemetry sequence mumber
 // The APRS connection client
 EthernetClient APRS_Client;
 
-// Statistics
-RunningMedian rmTemp = RunningMedian(aprsMsrmMax);
-RunningMedian rmPres = RunningMedian(aprsMsrmMax);
-RunningMedian rmVcc  = RunningMedian(aprsMsrmMax);
-RunningMedian rmRSSI = RunningMedian(aprsMsrmMax);
-RunningMedian rmHeap = RunningMedian(aprsMsrmMax);
+// Statistics (median filtering)
+MedianFilter rmTemp(aprsMsrmMax, 0);
+MedianFilter rmPres(aprsMsrmMax, 0);
+MedianFilter rmVcc (aprsMsrmMax, 0);
+MedianFilter rmRSSI(aprsMsrmMax, 0);
+MedianFilter rmHeap(aprsMsrmMax, 0);
 
 // Sensors
 const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
@@ -155,9 +153,7 @@ void aprsAuthenticate() {
   @param pres athmospheric pressure
   @param lux illuminance
 */
-void aprsSendWeather(float temp, float hmdt, float pres, float lux) {
-  // Temperature will be in Fahrenheit
-  float fahr = temp * 9 / 5 + 32;
+void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
   aprsSendHeader('@');
   // Compose the APRS packet
   APRS_Client.print(aprsTime());
@@ -165,9 +161,9 @@ void aprsSendWeather(float temp, float hmdt, float pres, float lux) {
   // Wind
   APRS_Client.print(F(".../...g..."));
   // Temperature
-  if (temp >= -273.15) {
+  if (temp >= -460) { // 0K in F
     char buf[5];
-    sprintf(buf, "t%03d", (int)fahr);
+    sprintf(buf, "t%03d", temp);
     APRS_Client.print(buf);
   }
   else {
@@ -187,7 +183,7 @@ void aprsSendWeather(float temp, float hmdt, float pres, float lux) {
   // Athmospheric pressure
   if (pres >= 0) {
     char buf[7];
-    sprintf(buf, "b%05d", (int)(pres / 10));
+    sprintf(buf, "b%05d", pres);
     APRS_Client.print(buf);
   }
   // Illuminance, if valid
@@ -424,15 +420,14 @@ void loop() {
     if (PROBE) aprsTlmBits = B10000000;
 
     // Read BMP280
-    float temp, pres, slvl;
+    float temp, pres;
     if (atmo_ok) {
       // Get the weather parameters
       temp = atmo.readTemperature();
       pres = atmo.readPressure();
-      slvl = pres * altCorr;
-      // Running Median
-      rmTemp.add(temp);
-      rmPres.add(slvl);
+      // Median Filter
+      rmTemp.in((int)(temp * 9 / 5 + 32));      // Store directly integer Fahrenheit
+      rmPres.in((int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
     }
 
     //rmTemp.add(GetTemp());
@@ -441,10 +436,10 @@ void loop() {
     int rssi = -67;
     int heap = 234;
     int vcc  = 3204;
-    // Running Median
-    rmVcc.add(vcc);
-    rmRSSI.add(rssi);
-    rmHeap.add(heap);
+    // Median Filter
+    rmVcc.in(vcc);
+    rmRSSI.in(rssi);
+    rmHeap.in(heap);
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
@@ -454,9 +449,9 @@ void loop() {
         Serial.println(aprsServer);
         aprsAuthenticate();
         //aprsSendPosition(" WxUnoProbe");
-        if (atmo_ok) aprsSendWeather(rmTemp.getMedian(), -1, rmPres.getMedian(), -1);
-        //aprsSendWeather(rmTemp.getMedian(), -1, -1, -1);
-        aprsSendTelemetry(rmVcc.getMedian(), rmRSSI.getMedian(), rmHeap.getMedian(), 0, 0, aprsTlmBits);
+        if (atmo_ok) aprsSendWeather(rmTemp.out(), -1, rmPres.out(), -1);
+        //aprsSendWeather(rmTemp.out(), -1, -1, -1);
+        aprsSendTelemetry(rmVcc.out(), rmRSSI.out(), rmHeap.out(), 0, 0, aprsTlmBits);
         //aprsSendStatus("Fine weather");
         //aprsSendTelemetrySetup();
         APRS_Client.stop();
