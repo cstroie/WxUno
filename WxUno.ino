@@ -30,7 +30,8 @@
 
 // The sensors are connected to I2C
 #include <Wire.h>
-#include <SparkFunBME280.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BMP280.h>
 
 // Ethernet
 #include <Ethernet.h>
@@ -71,9 +72,9 @@ const char *aprsCallSign = "FW0727";
 const char *aprsPassCode = "-1";
 const char *aprsLocation = "4455.29N/02527.08E_";
 const char *aprsPath = ">APRS,TCPIP*:";
-const int   altMeters = 282;
+const int   altMeters = 83; // 282
 const long  altFeet = (long)(altMeters * 3.28084);
-float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25588));
+float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25578));
 char  aprsTlmBits = B00000000;   // Telemetry bits
 // Reports and measurements
 const int   aprsRprtHour = 10;  // Number of APRS reports per hour
@@ -85,7 +86,6 @@ EthernetClient APRS_Client;
 
 // Statistics
 RunningMedian rmTemp = RunningMedian(aprsMsrmMax);
-RunningMedian rmHmdt = RunningMedian(aprsMsrmMax);
 RunningMedian rmPres = RunningMedian(aprsMsrmMax);
 RunningMedian rmVcc  = RunningMedian(aprsMsrmMax);
 RunningMedian rmRSSI = RunningMedian(aprsMsrmMax);
@@ -94,7 +94,7 @@ RunningMedian rmHeap = RunningMedian(aprsMsrmMax);
 // Sensors
 const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
 unsigned long snsNextTime = 0UL;  // The next time to read the sensors
-BME280 atmo;                      // The athmospheric sensor
+Adafruit_BMP280 atmo;             // The athmospheric sensor
 bool atmo_ok = false;             // The athmospheric sensor flag
 
 void aprsSend(const char *pkt) {
@@ -395,23 +395,14 @@ void setup() {
   UDP.begin(ntpLocalPort);
   setSyncProvider(getNtpTime);
 
-  // BME280
-  atmo.settings.commInterface = I2C_MODE;
-  atmo.settings.I2CAddress = 0x77;
-  atmo.settings.runMode = 3;
-  atmo.settings.tStandby = 0;
-  atmo.settings.filter = 0;
-  atmo.settings.tempOverSample = 1;
-  atmo.settings.pressOverSample = 1;
-  atmo.settings.humidOverSample = 1;
-  delay(10);
-  if (atmo.begin() == 0x60) {
+  // BMP280
+  if (atmo.begin(0x76)) {
     atmo_ok = true;
-    Serial.println(F("BME280 sensor detected."));
+    Serial.println(F("BMP280 sensor detected."));
   }
   else {
     atmo_ok = false;
-    Serial.println(F("BME280 sensor missing."));
+    Serial.println(F("BMP280 sensor missing."));
   }
 
   // Initialize the random number generator and set the APRS telemetry start sequence
@@ -419,7 +410,7 @@ void setup() {
   aprsTlmSeq = random(1000);
 
   // Start the sensor timer
-  snsNextTime = millis() + snsDelay;
+  snsNextTime = millis(); // + snsDelay;
 }
 
 void loop() {
@@ -432,22 +423,19 @@ void loop() {
     // Set the telemetry bit 7 if the station is being probed
     if (PROBE) aprsTlmBits = B10000000;
 
-    // Read BME280
-    float temp, pres, slvl, hmdt, dewp;
+    // Read BMP280
+    float temp, pres, slvl;
     if (atmo_ok) {
       // Get the weather parameters
-      temp = atmo.readTempC();
-      pres = atmo.readFloatPressure();
+      temp = atmo.readTemperature();
+      pres = atmo.readPressure();
       slvl = pres * altCorr;
-      hmdt = atmo.readFloatHumidity();
-      dewp = 243.04 * (log(hmdt / 100.0) + ((17.625 * temp) / (243.04 + temp))) / (17.625 - log(hmdt / 100.0) - ((17.625 * temp) / (243.04 + temp)));
       // Running Median
       rmTemp.add(temp);
-      rmHmdt.add(hmdt);
       rmPres.add(slvl);
     }
 
-    rmTemp.add(GetTemp());
+    //rmTemp.add(GetTemp());
 
     // Various telemetry
     int rssi = -67;
@@ -466,8 +454,8 @@ void loop() {
         Serial.println(aprsServer);
         aprsAuthenticate();
         //aprsSendPosition(" WxUnoProbe");
-        if (atmo_ok) aprsSendWeather(rmTemp.getMedian(), rmHmdt.getMedian(), rmPres.getMedian(), -1);
-        aprsSendWeather(rmTemp.getMedian(), -1, -1, -1);
+        if (atmo_ok) aprsSendWeather(rmTemp.getMedian(), -1, rmPres.getMedian(), -1);
+        //aprsSendWeather(rmTemp.getMedian(), -1, -1, -1);
         aprsSendTelemetry(rmVcc.getMedian(), rmRSSI.getMedian(), rmHeap.getMedian(), 0, 0, aprsTlmBits);
         //aprsSendStatus("Fine weather");
         //aprsSendTelemetrySetup();
