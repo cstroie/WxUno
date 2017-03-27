@@ -40,12 +40,9 @@
 // NTP
 #include <TimeLib.h>
 
-// Statistics
-#include <MedianFilter.h>
-
 // Device name
 char *NODENAME = "WxUno";
-char *VERSION = "0.2";
+char *VERSION = "1.0";
 bool  PROBE = true;    // True if the station is being probed
 
 // Ethernet
@@ -73,21 +70,23 @@ const char *aprsPath = ">APRS,TCPIP*:";
 const int   altMeters = 83; // 282
 const long  altFeet = (long)(altMeters * 3.28084);
 float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25578));
-char  aprsTlmBits = B00000000;   // Telemetry bits
 // Reports and measurements
 const int   aprsRprtHour = 10;  // Number of APRS reports per hour
-const int   aprsMsrmMax = 5;    // Number of measurements per report (keep even)
+const int   aprsMsrmMax = 3;    // Number of measurements per report (keep even)
 int         aprsMsrmCount = 0;  // Measurements counter
 int         aprsTlmSeq = 0;     // Telemetry sequence mumber
+// Telemetry bits
+char        aprsTlmBits = B00000000;
 // The APRS connection client
 EthernetClient APRS_Client;
 
-// Statistics (median filtering)
-MedianFilter rmTemp(aprsMsrmMax, 0);
-MedianFilter rmPres(aprsMsrmMax, 0);
-MedianFilter rmVcc (aprsMsrmMax, 0);
-MedianFilter rmRSSI(aprsMsrmMax, 0);
-MedianFilter rmHeap(aprsMsrmMax, 0);
+// Statistics (median filter for the last 3 values)
+int rmTemp[4];
+int rmPres[4];
+int  rmVcc[4];
+int rmRSSI[4];
+int rmHeap[4];
+int  rmMCU[4];
 
 // Sensors
 const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
@@ -95,26 +94,53 @@ unsigned long snsNextTime = 0UL;  // The next time to read the sensors
 Adafruit_BMP280 atmo;             // The athmospheric sensor
 bool atmo_ok = false;             // The athmospheric sensor flag
 
+/*
+  Simple median filter
+  2014-03-25: started by David Cary
+*/
+int mdnOut(int *buf) {
+  if (buf[0] < 3) return buf[3];
+  else {
+    int the_max = max(max(buf[1], buf[2]), buf[3]);
+    int the_min = min(min(buf[1], buf[2]), buf[3]);
+    // unnecessarily clever code
+    int the_median = the_max ^ the_min ^ buf[1] ^ buf[2] ^ buf[3];
+    return the_median;
+  }
+}
+
+void mdnIn(int *buf, int x) {
+  if (buf[0] < 3) buf[0]++;
+  buf[1] = buf[2];
+  buf[2] = buf[3];
+  buf[3] = x;
+}
+
 void aprsSend(const char *pkt) {
-  APRS_Client.println(pkt);
 #ifdef DEBUG
-  Serial.print(F("APRS: "));
-  Serial.println(pkt);
+  Serial.print(pkt);
 #endif
+  APRS_Client.print(pkt);
 }
 
-void aprsSendHeader(char sep) {
-  APRS_Client.print(aprsCallSign);
-  APRS_Client.print(F(">APRS,TCPIP*:"));
-  APRS_Client.print(sep);
+void aprsSend(const __FlashStringHelper *pkt) {
+#ifdef DEBUG
+  Serial.print(pkt);
+#endif
+  APRS_Client.print(pkt);
 }
 
-char *aprsHeader(const char *sep) {
-  char pkt[30];
-  strcat(pkt, aprsCallSign);
-  strcat(pkt, aprsPath);
-  strcat(pkt, sep);
-  return pkt;
+void aprsSendCRLF() {
+#ifdef DEBUG
+  Serial.print(F("\r\n"));
+#endif
+  APRS_Client.print(F("\r\n"));
+}
+
+void aprsSendHeader(const char *sep) {
+  aprsSend(aprsCallSign);
+  aprsSend(aprsPath);
+  aprsSend(sep);
 }
 
 /**
@@ -132,16 +158,15 @@ char *aprsTime() {
   user FW0690 pass -1 vers WxUno 0.2"
 */
 void aprsAuthenticate() {
-  char pkt[50] = "";
-  strcat_P(pkt, PSTR("user "));
-  strcat(pkt, aprsCallSign);
-  strcat_P(pkt, PSTR(" pass "));
-  strcat(pkt, aprsPassCode);
-  strcat_P(pkt, PSTR(" vers "));
-  strcat(pkt, NODENAME);
-  strcat_P(pkt, PSTR(" "));
-  strcat(pkt, VERSION);
-  aprsSend(pkt);
+  aprsSend(F("user "));
+  aprsSend(aprsCallSign);
+  aprsSend(F(" pass "));
+  aprsSend(aprsPassCode);
+  aprsSend(F(" vers "));
+  aprsSend(NODENAME);
+  aprsSend(F(" "));
+  aprsSend(VERSION);
+  aprsSendCRLF();
 }
 
 /**
@@ -154,46 +179,47 @@ void aprsAuthenticate() {
   @param lux illuminance
 */
 void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
-  aprsSendHeader('@');
+  aprsSendHeader("@");
   // Compose the APRS packet
-  APRS_Client.print(aprsTime());
-  APRS_Client.print(aprsLocation);
+  aprsSend(aprsTime());
+  aprsSend(aprsLocation);
   // Wind
-  APRS_Client.print(F(".../...g..."));
+  aprsSend(F(".../...g..."));
   // Temperature
   if (temp >= -460) { // 0K in F
     char buf[5];
-    sprintf(buf, "t%03d", temp);
-    APRS_Client.print(buf);
+    sprintf_P(buf, PSTR("t%03d"), temp);
+    aprsSend(buf);
   }
   else {
-    APRS_Client.print(F("t..."));
+    aprsSend(F("t..."));
   }
   // Humidity
   if (hmdt >= 0) {
     if (hmdt == 100) {
-      APRS_Client.print(F("h00"));
+      aprsSend(F("h00"));
     }
     else {
       char buf[5];
-      sprintf(buf, "h%02d", (int)hmdt);
-      APRS_Client.print(buf);
+      sprintf_P(buf, PSTR("h%02d"), hmdt);
+      aprsSend(buf);
     }
   }
   // Athmospheric pressure
   if (pres >= 0) {
     char buf[7];
-    sprintf(buf, "b%05d", pres);
-    APRS_Client.print(buf);
+    sprintf_P(buf, PSTR("b%05d"), pres);
+    aprsSend(buf);
   }
   // Illuminance, if valid
   if (lux >= 0) {
     char buf[5];
-    sprintf(buf, "L%02d", (int)(lux * 0.0079));
-    APRS_Client.print(buf);
+    sprintf_P(buf, PSTR("L%02d"), (int)(lux * 0.0079));
+    aprsSend(buf);
   }
   // Comment (device name)
-  APRS_Client.println(NODENAME);
+  aprsSend(NODENAME);
+  aprsSendCRLF();
 }
 
 /**
@@ -210,18 +236,17 @@ void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
 void aprsSendTelemetry(int vcc, int rssi, int heap, unsigned int luxVis, unsigned int luxIrd, byte bits) {
   // Increment the telemetry sequence number, reset it if exceeds 999
   if (++aprsTlmSeq > 999) aprsTlmSeq = 0;
-  // Send the telemetry setup on power up (first 5 minutes) or if the sequence number is 0
-  if ((aprsTlmSeq == 0) or (millis() < 300000UL)) aprsSendTelemetrySetup();
+  // Send the telemetry setup on power up (first minutes) or if the sequence number is 0
+  if ((aprsTlmSeq == 0) or (millis() < snsDelay)) aprsSendTelemetrySetup();
   // Compose the APRS packet
-  char pkt[60];
-  strcpy(pkt, aprsHeader("T"));
+  aprsSendHeader("T");
   char buf[40];
   sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, (int)((vcc - 2500) / 4), -rssi, (int)(heap / 200), luxVis, luxIrd);
-  strcat(pkt, buf);
+  aprsSend(buf);
   char bbuf[10];
   itoa(bits, bbuf, 2);
-  strcat(pkt, bbuf);
-  aprsSend(pkt);
+  aprsSend(bbuf);
+  aprsSendCRLF();
 }
 
 /**
@@ -229,35 +254,30 @@ void aprsSendTelemetry(int vcc, int rssi, int heap, unsigned int luxVis, unsigne
 */
 void aprsSendTelemetrySetup() {
   char padCallSign[10];
-  sprintf(padCallSign, "%-9s", aprsCallSign);
-  char pkt[120];
-  const char *hdr = aprsHeader(":");
+  sprintf_P(padCallSign, PSTR("%-9s"), aprsCallSign);
   // Parameter names
-  strcpy(pkt, hdr);
-  strcat(pkt, padCallSign);
-  strcat_P(pkt, PSTR(":PARM.Vcc,RSSI,Heap,Temp,NA,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
-  aprsSend(pkt);
+  aprsSendHeader(":");
+  aprsSend(padCallSign);
+  aprsSend(F(":PARM.Vcc,RSSI,Heap,Temp,A5,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
+  aprsSendCRLF();
   // Equations
-  hdr = aprsHeader(":");
-  strcpy(pkt, hdr);
-  strcat(pkt, padCallSign);
-  strcat_P(pkt, PSTR(":EQNS.0,0.004,2.5,0,-1,0,0,200,0,0,1,0,0,1,0"));
-  aprsSend(pkt);
+  aprsSendHeader(":");
+  aprsSend(padCallSign);
+  aprsSend(F(":EQNS.0,0.004,2.5,0,-1,0,0,200,0,0,1,0,0,1,0"));
+  aprsSendCRLF();
   // Units
-  hdr = aprsHeader(":");
-  strcpy(pkt, hdr);
-  strcat(pkt, padCallSign);
-  strcat_P(pkt, PSTR(":UNIT.V,dBm,Bytes,C,units,prb,on,on,sat,low,N/A,N/A,N/A"));
-  aprsSend(pkt);
+  aprsSendHeader(":");
+  aprsSend(padCallSign);
+  aprsSend(F(":UNIT.V,dBm,Bytes,C,N/A,prb,on,on,sat,low,N/A,N/A,N/A"));
+  aprsSendCRLF();
   // Bit sense and project name
-  hdr = aprsHeader(":");
-  strcpy(pkt, hdr);
-  strcat(pkt, padCallSign);
-  strcat_P(pkt, PSTR(":BITS.10011111, "));
-  strcat(pkt, NODENAME);
-  strcat_P(pkt, PSTR("/"));
-  strcat(pkt, VERSION);
-  aprsSend(pkt);
+  aprsSendHeader(":");
+  aprsSend(padCallSign);
+  aprsSend(F(":BITS.10011111, "));
+  aprsSend(NODENAME);
+  aprsSend(F("/"));
+  aprsSend(VERSION);
+  aprsSendCRLF();
 }
 
 /**
@@ -268,10 +288,11 @@ void aprsSendTelemetrySetup() {
 */
 void aprsSendStatus(const char *message) {
   // Send only if the message is not empty
-  if (message != "") {
+  if (message[0] != '\0') {
     // Send the APRS packet
-    aprsSendHeader('>');
-    APRS_Client.println(message);
+    aprsSendHeader(">");
+    aprsSend(message);
+    aprsSendCRLF();
   }
 }
 
@@ -283,13 +304,14 @@ void aprsSendStatus(const char *message) {
 */
 void aprsSendPosition(const char *comment) {
   // Compose the APRS packet
-  aprsSendHeader('!');
-  APRS_Client.print(aprsLocation);
-  APRS_Client.print(F("/000/000/A="));
+  aprsSendHeader("!");
+  aprsSend(aprsLocation);
+  aprsSend(F("/000/000/A="));
   char buf[7];
-  sprintf(buf, "%06d", altFeet);
-  APRS_Client.print(buf);
-  APRS_Client.println(comment);
+  sprintf_P(buf, PSTR("%06d"), altFeet);
+  aprsSend(buf);
+  aprsSend(comment);
+  aprsSendCRLF();
 }
 
 time_t getNtpTime()
@@ -338,10 +360,9 @@ void sendNTPpacket()
   UDP.endPacket();
 }
 
-double GetTemp(void)
-{
+int getMCUTemp() {
   unsigned int wADC;
-  double t;
+  float temp;
 
   // The internal temperature has to be used
   // with the internal reference of 1.1V.
@@ -363,10 +384,10 @@ double GetTemp(void)
   wADC = ADCW;
 
   // The offset could be wrong. It is just an indication.
-  t = (wADC - 335.2 ) / 1.06154;
+  temp = (wADC - 335.2) / 1.06154;
 
   // The returned temperature is in degrees Celsius.
-  return (t);
+  return temp;
 }
 
 void setup() {
@@ -401,12 +422,20 @@ void setup() {
     Serial.println(F("BMP280 sensor missing."));
   }
 
+  // Debug
+  //Serial.print(F("Reports per hour: "));
+  //Serial.println(aprsRprtHour);
+  //Serial.print(F("Measurement per report: "));
+  //Serial.println(aprsMsrmMax);
+  //Serial.print(F("Measurements delay: "));
+  //Serial.println(snsDelay);
+
   // Initialize the random number generator and set the APRS telemetry start sequence
   if (timeStatus() != timeNotSet) randomSeed(now());
   aprsTlmSeq = random(1000);
 
   // Start the sensor timer
-  snsNextTime = millis(); // + snsDelay;
+  snsNextTime = millis() + snsDelay;
 }
 
 void loop() {
@@ -422,24 +451,29 @@ void loop() {
     // Read BMP280
     float temp, pres;
     if (atmo_ok) {
+      // Set the bit 5 to show the sensor is present (reverse)
+      aprsTlmBits |= B01000000;
       // Get the weather parameters
       temp = atmo.readTemperature();
       pres = atmo.readPressure();
       // Median Filter
-      rmTemp.in((int)(temp * 9 / 5 + 32));      // Store directly integer Fahrenheit
-      rmPres.in((int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
+      mdnIn(rmTemp, (int)(temp * 9 / 5 + 32));      // Store directly integer Fahrenheit
+      mdnIn(rmPres, (int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
     }
 
-    //rmTemp.add(GetTemp());
-
     // Various telemetry
-    int rssi = -67;
-    int heap = 234;
-    int vcc  = 3204;
+    int rssi = -(analogRead(A0) / 4);
+    int heap = analogRead(A1) / 4;
+    int vcc  = analogRead(A2) / 4;
+    if (vcc < 3000) {
+      // Set the bit 3 to show the battery is low
+      aprsTlmBits |= B00001000;
+    }
     // Median Filter
-    rmVcc.in(vcc);
-    rmRSSI.in(rssi);
-    rmHeap.in(heap);
+    mdnIn(rmVcc,  vcc);
+    mdnIn(rmRSSI, rssi);
+    mdnIn(rmHeap, heap);
+    mdnIn(rmMCU,  getMCUTemp());
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
@@ -449,12 +483,13 @@ void loop() {
         Serial.println(aprsServer);
         aprsAuthenticate();
         //aprsSendPosition(" WxUnoProbe");
-        if (atmo_ok) aprsSendWeather(rmTemp.out(), -1, rmPres.out(), -1);
+        if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), -1);
         //aprsSendWeather(rmTemp.out(), -1, -1, -1);
-        aprsSendTelemetry(rmVcc.out(), rmRSSI.out(), rmHeap.out(), 0, 0, aprsTlmBits);
+        aprsSendTelemetry(mdnOut(rmVcc), mdnOut(rmRSSI), mdnOut(rmHeap), mdnOut(rmMCU), 0, aprsTlmBits);
         //aprsSendStatus("Fine weather");
         //aprsSendTelemetrySetup();
         APRS_Client.stop();
+        Serial.print(F("Disconnected."));
       }
       else Serial.println(F("Connection failed"));
     }
