@@ -360,7 +360,7 @@ void sendNTPpacket()
   UDP.endPacket();
 }
 
-int getMCUTemp() {
+float getMCUTemp() {
   unsigned int wADC;
   float temp;
 
@@ -384,7 +384,7 @@ int getMCUTemp() {
   wADC = ADCW;
 
   // The offset could be wrong. It is just an indication.
-  temp = (wADC - 335.2) / 1.06154;
+  temp = 0.8487 * wADC - 258.4;;
 
   // The returned temperature is in degrees Celsius.
   return temp;
@@ -473,7 +473,7 @@ void loop() {
     mdnIn(rmA0, a0);
     mdnIn(rmA1, a1);
     mdnIn(rmA2, a2);
-    mdnIn(rmMCU, getMCUTemp());
+    mdnIn(rmMCU, (int)getMCUTemp());
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
