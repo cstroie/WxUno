@@ -42,7 +42,7 @@
 
 // Device name
 char *NODENAME = "WxUno";
-char *VERSION = "1.0";
+char *VERSION = "1.1";
 bool  PROBE = true;    // True if the station is being probed
 
 // Ethernet
@@ -86,7 +86,6 @@ int rmPres[4];
 int rmA0[4];
 int rmA1[4];
 int rmA2[4];
-int rmMCU[4];
 
 // Sensors
 const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
@@ -233,7 +232,7 @@ void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
   @param luxIrd raw infrared illuminance
   @bits digital inputs
 */
-void aprsSendTelemetry(int a0, int a1, int a2, int a3, int temp, byte bits) {
+void aprsSendTelemetry(int a0, int a1, int a2, int vcc, int temp, byte bits) {
   // Increment the telemetry sequence number, reset it if exceeds 999
   if (++aprsTlmSeq > 999) aprsTlmSeq = 0;
   // Send the telemetry setup on power up (first minutes) or if the sequence number is 0
@@ -241,7 +240,7 @@ void aprsSendTelemetry(int a0, int a1, int a2, int a3, int temp, byte bits) {
   // Compose the APRS packet
   aprsSendHeader("T");
   char buf[40];
-  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, (int)(a0 / 4), (int)(a1 / 4), (int)(a2 / 4), a3, temp);
+  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, a0, a1, a2, vcc, temp);
   aprsSend(buf);
   char bbuf[10];
   itoa(bits, bbuf, 2);
@@ -258,17 +257,17 @@ void aprsSendTelemetrySetup() {
   // Parameter names
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":PARM.LDR,Thrm,Vcc,A3,Temp,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
+  aprsSend(F(":PARM.Light,Thrm,A2,Vcc,Tmp,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
   aprsSendCRLF();
   // Equations
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":EQNS.0,4,0,0,4,0,0,4,0,0,1,0,0,1,0"));
+  aprsSend(F(":EQNS.0,20,0,0,20,0,0,20,0,0,0.004,4.5,0,1,-100"));
   aprsSendCRLF();
   // Units
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":UNIT.lux,C,V,N/A,C,prb,on,on,sat,low,N/A,N/A,N/A"));
+  aprsSend(F(":UNIT.lux,mV,mV,V,C,prb,on,on,sat,low,N/A,N/A,N/A"));
   aprsSendCRLF();
   // Bit sense and project name
   aprsSendHeader(":");
@@ -360,9 +359,9 @@ void sendNTPpacket()
   UDP.endPacket();
 }
 
-float getMCUTemp() {
+int readMCUTemp() {
   unsigned int wADC;
-  float temp;
+  int temp;
 
   // The internal temperature has to be used
   // with the internal reference of 1.1V.
@@ -383,11 +382,42 @@ float getMCUTemp() {
   // Reading register "ADCW" takes care of how to read ADCL and ADCH.
   wADC = ADCW;
 
-  // The offset could be wrong. It is just an indication.
-  temp = 0.8487 * wADC - 258.4;;
+  // Use the calibration
+  temp = 84.87 * wADC - 25840;
 
   // The returned temperature is in degrees Celsius.
   return temp;
+}
+
+/*
+  Read the power supply voltage, by measuring the internal 1V1 reference
+*/
+int readVcc() {
+  // Read 1.1V reference against AVcc
+  // set the reference to Vcc and the measurement to the internal 1.1V reference
+#if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
+  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
+  ADMUX = _BV(MUX5) | _BV(MUX0);
+#elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
+  ADMUX = _BV(MUX3) | _BV(MUX2);
+#else
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+#endif
+
+  delay(1); // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC); // Start conversion
+  while (bit_is_set(ADCSRA, ADSC)); // measuring
+
+  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH
+  uint8_t high = ADCH; // unlocks both
+  long result = (high << 8) | low;
+
+  // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
+  result = 1125300L / result;
+
+  // Return Vcc in mV
+  return (int)result;
 }
 
 void setup() {
@@ -422,16 +452,9 @@ void setup() {
     Serial.println(F("BMP280 sensor missing."));
   }
 
-  // Debug
-  //Serial.print(F("Reports per hour: "));
-  //Serial.println(aprsRprtHour);
-  //Serial.print(F("Measurement per report: "));
-  //Serial.println(aprsMsrmMax);
-  //Serial.print(F("Measurements delay: "));
-  //Serial.println(snsDelay);
-
   // Initialize the random number generator and set the APRS telemetry start sequence
   if (timeStatus() != timeNotSet) randomSeed(now());
+  else                            randomSeed(readMCUTemp());
   aprsTlmSeq = random(1000);
 
   // Start the sensor timer
@@ -461,19 +484,22 @@ void loop() {
       mdnIn(rmPres, (int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
     }
 
-    // Various telemetry
-    int a0 = analogRead(A0);
-    int a1 = analogRead(A1);
-    int a2 = analogRead(A2);
-    if (a2 < 512) {
+    // Read Vcc first (mV)
+    int vcc = readVcc();
+    if (vcc < 5000) {
       // Set the bit 3 to show the battery is low
       aprsTlmBits |= B00001000;
     }
+
+    // Various telemetry
+    int a0 = ((unsigned long)vcc * (unsigned long)analogRead(A0)) / 20480;
+    int a1 = ((unsigned long)vcc * (unsigned long)analogRead(A1)) / 20480;
+    int a2 = ((unsigned long)vcc * (unsigned long)analogRead(A2)) / 20480;
+
     // Median Filter
     mdnIn(rmA0, a0);
     mdnIn(rmA1, a1);
     mdnIn(rmA2, a2);
-    mdnIn(rmMCU, (int)getMCUTemp());
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
@@ -485,11 +511,11 @@ void loop() {
         //aprsSendPosition(" WxUnoProbe");
         if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), -1);
         //aprsSendWeather(rmTemp.out(), -1, -1, -1);
-        aprsSendTelemetry(mdnOut(rmA0), mdnOut(rmA1), mdnOut(rmA2), 0, mdnOut(rmMCU), aprsTlmBits);
+        aprsSendTelemetry(mdnOut(rmA0), mdnOut(rmA1), mdnOut(rmA2), (vcc - 4500) / 4, readMCUTemp() / 100 + 100, aprsTlmBits);
         //aprsSendStatus("Fine weather");
         //aprsSendTelemetrySetup();
         APRS_Client.stop();
-        Serial.print(F("Disconnected."));
+        Serial.println(F("Disconnected."));
       }
       else Serial.println(F("Connection failed"));
     }
