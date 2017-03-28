@@ -213,7 +213,7 @@ void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
   // Illuminance, if valid
   if (lux >= 0) {
     char buf[5];
-    sprintf_P(buf, PSTR("L%02d"), (int)(lux * 0.0079));
+    sprintf_P(buf, PSTR("L%03d"), (int)(lux * 0.0079));
     aprsSend(buf);
   }
   // Comment (device name)
@@ -267,7 +267,7 @@ void aprsSendTelemetrySetup() {
   // Units
   aprsSendHeader(":");
   aprsSend(padCallSign);
-  aprsSend(F(":UNIT.lux,mV,mV,V,C,prb,on,on,sat,low,N/A,N/A,N/A"));
+  aprsSend(F(":UNIT.mV,mV,mV,V,C,prb,on,on,sat,low,N/A,N/A,N/A"));
   aprsSendCRLF();
   // Bit sense and project name
   aprsSendHeader(":");
@@ -414,7 +414,8 @@ int readVcc() {
   long result = (high << 8) | low;
 
   // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  result = 1125300L / result;
+  // Calibration: 1.074
+  result = 1098702L / result;
 
   // Return Vcc in mV
   return (int)result;
@@ -492,14 +493,17 @@ void loop() {
     }
 
     // Various telemetry
-    int a0 = ((unsigned long)vcc * (unsigned long)analogRead(A0)) / 20480;
-    int a1 = ((unsigned long)vcc * (unsigned long)analogRead(A1)) / 20480;
-    int a2 = ((unsigned long)vcc * (unsigned long)analogRead(A2)) / 20480;
+    int a0 = analogRead(A0);
+    int a1 = analogRead(A1);
+    int a2 = analogRead(A2);
 
     // Median Filter
-    mdnIn(rmA0, a0);
-    mdnIn(rmA1, a1);
-    mdnIn(rmA2, a2);
+    mdnIn(rmA0, ((unsigned long)vcc * (unsigned long)a0) / 20480);
+    mdnIn(rmA1, ((unsigned long)vcc * (unsigned long)a1) / 20480);
+    mdnIn(rmA2, ((unsigned long)vcc * (unsigned long)a2) / 20480);
+
+    // 500 / R(kO); R = R0(1023/x-1)
+    int lux = 51150L / a0 - 50;
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
@@ -509,7 +513,7 @@ void loop() {
         Serial.println(aprsServer);
         aprsAuthenticate();
         //aprsSendPosition(" WxUnoProbe");
-        if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), -1);
+        if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), lux);
         //aprsSendWeather(rmTemp.out(), -1, -1, -1);
         aprsSendTelemetry(mdnOut(rmA0), mdnOut(rmA1), mdnOut(rmA2), (vcc - 4500) / 4, readMCUTemp() / 100 + 100, aprsTlmBits);
         //aprsSendStatus("Fine weather");
