@@ -394,14 +394,15 @@ int readMCUTemp() {
   ADMUX = (_BV(REFS1) | _BV(REFS0) | _BV(MUX3));
   ADCSRA |= _BV(ADEN);  // enable the ADC
 
-  delay(2);                         // Wait for voltages to become stable.
+  delay(10);                        // Wait for voltages to become stable.
   ADCSRA |= _BV(ADSC);              // Start the ADC
   while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
 
   // Reading register "ADCW" takes care of how to read ADCL and ADCH.
-  unsigned int wADC = ADCW;
-  // The returned temperature is in degrees Celsius; calibrate
-  return 84.87 * wADC - 25840;
+  long wADC = ADCW;
+
+  // The returned temperature is in hundreds degrees Celsius; calibrated
+  return (int)(84.87 * wADC - 25840);
 }
 
 /*
@@ -420,13 +421,13 @@ int readVcc() {
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
 #endif
 
-  delay(2);                         // Wait for Vref to settle
+  delay(10);                        // Wait for Vref to settle
   ADCSRA |= _BV(ADSC);              // Start conversion
   while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
 
   // Reading register "ADCW" takes care of how to read ADCL and ADCH.
-  unsigned long wADC = ADCW;
-  // Return Vcc in mV; 1125300 = 1.1*1023*1000
+  long wADC = ADCW;
+  // Return Vcc in mV; 1125300 = 1.1 * 1023 * 1000
   // Calibration: 1.074
   return (int)(1098702UL / wADC);
 }
@@ -471,7 +472,7 @@ void setup() {
   aprsTlmSeq = random(1000);
 
   // Start the sensor timer
-  snsNextTime = millis() + snsDelay;
+  snsNextTime = millis();
 }
 
 void loop() {
@@ -512,12 +513,18 @@ void loop() {
     int a2 = analogRead(A2);
 
     // Median Filter
-    mdnIn(rmA0, ((unsigned long)vcc * (unsigned long)a0) / 20480);
+    mdnIn(rmA0, ((unsigned long)vcc * (1023UL - (unsigned long)a0)) / 20480);
     mdnIn(rmA1, ((unsigned long)vcc * (unsigned long)a1) / 20480);
     mdnIn(rmA2, ((unsigned long)vcc * (unsigned long)a2) / 20480);
 
+    // Upper part
     // 500 / R(kO); R = R0(1023/x-1)
-    int lux = 51150L / a0 - 50;
+    // Lower part
+    // Vout=RawADC0*0.0048828125;
+    // lux=(2500/Vout-500)/10;
+    
+    //int lux = 51150L / a0 - 50;
+    int lux = (2500 * 5 / 1023 / a0 - 500) / 10;
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
