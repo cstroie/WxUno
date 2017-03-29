@@ -52,6 +52,10 @@ byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 // Set the static IP address to use if the DHCP fails to assign
 IPAddress ip(192, 168, 0, 177);
 
+// The APRS connection client
+EthernetClient APRS_Client;
+EthernetClient TIME_Client;
+
 // NTP
 const int   TZ = 0;
 const char *NTP_SERVER = "europe.pool.ntp.org";
@@ -77,8 +81,6 @@ int         aprsMsrmCount = 0;  // Measurements counter
 int         aprsTlmSeq = 0;     // Telemetry sequence mumber
 // Telemetry bits
 char        aprsTlmBits = B00000000;
-// The APRS connection client
-EthernetClient APRS_Client;
 
 // Statistics (median filter for the last 3 values)
 int rmTemp[4];
@@ -313,8 +315,32 @@ void aprsSendPosition(const char *comment) {
   aprsSendCRLF();
 }
 
-time_t getNtpTime()
-{
+time_t getUNIXTime() {
+  union {
+    uint32_t t = 0UL;
+    uint8_t  b[4];
+  } uxtm;
+  int i = 3;
+  if (TIME_Client.connect("utcnist.colorado.edu", 37)) {
+    unsigned int timeout = millis() + 10000UL;   // 10 seconds timeout
+    while (millis() <= timeout and i >= 0) {
+      if (TIME_Client.available()) uxtm.b[i--] = TIME_Client.read();
+    }
+    TIME_Client.stop();
+  }
+  if (i < 0) {
+    uint32_t tm = uxtm.t - 2208988800UL + TZ * SECS_PER_HOUR;
+    Serial.print(F("Time sync: "));
+    Serial.println(tm);
+    return tm;
+  }
+  else {
+    Serial.println(F("Time sync error"));
+    return 0;
+  }
+}
+
+time_t getNtpTime() {
   while (UDP.parsePacket() > 0) ; // discard any previously received packets
   sendNTPpacket();
   uint32_t beginWait = millis();
@@ -337,8 +363,7 @@ time_t getNtpTime()
 }
 
 // send an NTP request to the time server at the given address
-void sendNTPpacket()
-{
+void sendNTPpacket() {
   // set all bytes in the buffer to 0
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
   // Initialize values needed to form NTP request
@@ -360,9 +385,6 @@ void sendNTPpacket()
 }
 
 int readMCUTemp() {
-  unsigned int wADC;
-  int temp;
-
   // The internal temperature has to be used
   // with the internal reference of 1.1V.
   // Channel 8 can not be selected with
@@ -372,21 +394,14 @@ int readMCUTemp() {
   ADMUX = (_BV(REFS1) | _BV(REFS0) | _BV(MUX3));
   ADCSRA |= _BV(ADEN);  // enable the ADC
 
-  delay(20);            // wait for voltages to become stable.
-
-  ADCSRA |= _BV(ADSC);  // Start the ADC
-
-  // Detect end-of-conversion
-  while (bit_is_set(ADCSRA, ADSC));
+  delay(2);                         // Wait for voltages to become stable.
+  ADCSRA |= _BV(ADSC);              // Start the ADC
+  while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
 
   // Reading register "ADCW" takes care of how to read ADCL and ADCH.
-  wADC = ADCW;
-
-  // Use the calibration
-  temp = 84.87 * wADC - 25840;
-
-  // The returned temperature is in degrees Celsius.
-  return temp;
+  unsigned int wADC = ADCW;
+  // The returned temperature is in degrees Celsius; calibrate
+  return 84.87 * wADC - 25840;
 }
 
 /*
@@ -405,19 +420,14 @@ int readVcc() {
   ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
 #endif
 
-  delay(1); // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC); // Start conversion
-  while (bit_is_set(ADCSRA, ADSC)); // measuring
+  delay(2);                         // Wait for Vref to settle
+  ADCSRA |= _BV(ADSC);              // Start conversion
+  while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
 
-  uint8_t low  = ADCL; // must read ADCL first - it then locks ADCH
-  uint8_t high = ADCH; // unlocks both
-  long result = (high << 8) | low;
-
-  // Calculate Vcc (in mV); 1125300 = 1.1*1023*1000
-  result = 1125300L / result;
-
-  // Return Vcc in mV
-  return (int)result;
+  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
+  unsigned long wADC = ADCW;
+  // Return Vcc in mV; 1125300 = 1.1*1023*1000
+  return (int)(1125300UL / wADC);
 }
 
 void setup() {
@@ -438,9 +448,11 @@ void setup() {
   // Give the Ethernet shield a second to initialize:
   delay(1000);
 
-  // Start the NTP sync
+  // Start time sync
   UDP.begin(ntpLocalPort);
-  setSyncProvider(getNtpTime);
+  //setSyncProvider(getNtpTime);
+  setSyncProvider(getUNIXTime);
+  setSyncInterval(60 * 60);
 
   // BMP280
   if (atmo.begin(0x76)) {
@@ -464,6 +476,8 @@ void setup() {
 void loop() {
   // Read the sensors and publish telemetry
   if (millis() >= snsNextTime) {
+    // Keep the time
+    now();
     // Check the DHCP lease
     Ethernet.maintain();
     // Count to check if we need to send the APRS data
