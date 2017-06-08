@@ -19,42 +19,113 @@
   WxUno.  If not, see <http://www.gnu.org/licenses/>.
 
 
-  WiFi connected weather station, reading the athmospheric sensor BME280 and
-  the illuminance sensor TSL2561 and publishing the measured data along with
-  various local telemetry.
+  Ethernet connected weather station, reading the temperature and athmospheric
+  pressure sensor BMP280, as well as internal temperature, supply voltage,
+  local illuminance, publishing the measured data to CWOP APRS.
 */
 
 // The DEBUG and DEVEL flag
 #define DEBUG
 #define DEVEL
 
+// Watchdog, sleep
+#include <avr/wdt.h>
+#include <avr/sleep.h>
+
+// EEPROM and CRC32
+#include <EEPROM.h>
+#include <CRC32.h>
+
 // The sensors are connected to I2C
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_BMP280.h>
+#include <BH1750.h>
 
 // Ethernet
+#include <SPI.h>
 #include <Ethernet.h>
 #include <EthernetUdp.h>
 
 // NTP
 #include <TimeLib.h>
 
-// Device name
-char *NODENAME = "WxUno";
-char *VERSION = "1.1";
-bool  PROBE = true;    // True if the station is being probed
+// Device name and software version
+const char NODENAME[] PROGMEM = "WxUno";
+const char VERSION[]  PROGMEM = "3.0";
+bool       PROBE              = true;                   // True if the station is being probed
+
+// APRS parameters
+const char  aprsServer[] PROGMEM  = "cwop5.aprs.net";   // CWOP APRS-IS server address to connect to
+const int   aprsPort              = 14580;              // CWOP APRS-IS port
+#ifdef DEVEL
+const int   altMeters             = 83;                 // Altitude in Bucharest
+#else
+const int   altMeters             = 282;                // Altitude in Targoviste
+#endif
+const long  altFeet = (long)(altMeters * 3.28084);                                    // Altitude in feet
+const float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25578));  // Altitude correction for QNH
+
+const char aprsCallSign[] PROGMEM = "FW0727";
+const char aprsPassCode[] PROGMEM = "-1";
+const char aprsPath[]     PROGMEM = ">APRS,TCPIP*:";
+const char aprsLocation[] PROGMEM = "4455.29N/02527.08E_";
+const char aprsTlmPARM[]  PROGMEM = ":PARM.Light,Soil,RSSI,Vcc,Tmp,PROBE,ATMO,LUX,SAT,BAT,TM,RB,B8";
+const char aprsTlmEQNS[]  PROGMEM = ":EQNS.0,20,0,0,20,0,0,-1,0,0,0.004,4.5,0,1,-100";
+const char aprsTlmUNIT[]  PROGMEM = ":UNIT.mV,mV,dBm,V,C,prb,on,on,sat,low,err,N/A,N/A";
+const char aprsTlmBITS[]  PROGMEM = ":BITS.10011111, ";
+const char eol[]          PROGMEM = "\r\n";
+
+char       aprsPkt[100]           = "";     // The APRS packet buffer, largest packet is 82 for v2.1
+
+// Time synchronization and keeping
+const char    timeServer[] PROGMEM  = "utcnist.colorado.edu";  // Time server address to connect to (RFC868)
+const int     timePort              = 37;                      // Time server port
+unsigned long timeNextSync          = 0UL;                     // Next time to syncronize
+unsigned long timeDelta             = 0UL;                     // Difference between real time and internal clock
+bool          timeOk                = false;                   // Flag to know the time is accurate
+const int     eeTime                = 0;                       // EEPROM address for storing last known good time
+
+// Reports and measurements
+const int aprsRprtHour   = 10; // Number of APRS reports per hour
+const int aprsMsrmMax    = 3;  // Number of measurements per report (keep even)
+int       aprsMsrmCount  = 0;  // Measurements counter
+int       aprsTlmSeq     = 0;  // Telemetry sequence mumber
+
+// Telemetry bits
+char      aprsTlmBits    = B00000000;
 
 // Ethernet
-// assign a MAC address for the ethernet controller.
-// fill in your address here:
-byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
+byte ethMAC[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
 // Set the static IP address to use if the DHCP fails to assign
-IPAddress ip(192, 168, 0, 177);
+IPAddress   ethIP(10, 200, 4, 99);
+IPAddress  ethDNS(10, 200, 4, 250);
+IPAddress   ethGW(10, 200, 4, 250);
+IPAddress  ethMSK(10, 200, 4, 255);
+bool       ethDHCP = false;
 
 // The APRS connection client
-EthernetClient APRS_Client;
-EthernetClient TIME_Client;
+EthernetClient  ethClient;
+EthernetClient  TIME_Client;
+unsigned long   linkLastTime = 0UL;             // Last connection time
+
+// When ADC completed, take an interrupt
+EMPTY_INTERRUPT(ADC_vect);
+
+// Statistics (round median filter for the last 3 values)
+enum      rMedIdx {MD_TEMP, MD_PRES, MD_RSSI, MD_SRAD, MD_VCC, MD_A0, MD_A1, MD_ALL};
+int       rMed[MD_ALL][4];
+const int eeRMed = 16; // EEPROM address for storing the round median array
+
+// Sensors
+const unsigned long snsReadTime = 30UL * 1000UL;                          // Total time to read sensors, repeatedly, for aprsMsrmMax times
+const unsigned long snsDelayBfr = 3600000UL / aprsRprtHour - snsReadTime; // Delay before sensor readings
+const unsigned long snsDelayBtw = snsReadTime / aprsMsrmMax;              // Delay between sensor readings
+unsigned long       snsNextTime = 0UL;                                    // Next time to read the sensors
+Adafruit_BMP280     atmo;                                                 // The athmospheric sensor
+bool                atmo_ok = false;                                      // The athmospheric sensor presence flag
+BH1750              light(0x23);                                          // The illuminance sensor
+bool                light_ok = false;                                     // The illuminance sensor presence flag
 
 // NTP
 const int   TZ = 0;
@@ -64,115 +135,202 @@ byte packetBuffer[NTP_PACKET_SIZE];
 unsigned int ntpLocalPort = 8888;
 EthernetUDP UDP;
 
-// APRS parameters
-const char *aprsServer = "cwop5.aprs.net";
-const int   aprsPort = 14580;
-const char *aprsCallSign = "FW0727";
-const char *aprsPassCode = "-1";
-const char *aprsLocation = "4455.29N/02527.08E_";
-const char *aprsPath = ">APRS,TCPIP*:";
-const int   altMeters = 83; // 282
-const long  altFeet = (long)(altMeters * 3.28084);
-float altCorr = pow((float)(1.0 - 2.25577e-5 * altMeters), (float)(-5.25578));
-// Reports and measurements
-const int   aprsRprtHour = 15;  // Number of APRS reports per hour
-const int   aprsMsrmMax = 3;    // Number of measurements per report (keep even)
-int         aprsMsrmCount = 0;  // Measurements counter
-int         aprsTlmSeq = 0;     // Telemetry sequence mumber
-// Telemetry bits
-char        aprsTlmBits = B00000000;
-
-// Statistics (median filter for the last 3 values)
-int rmTemp[4];
-int rmPres[4];
-int rmA0[4];
-int rmA1[4];
-int rmA2[4];
-
-// Sensors
-const unsigned long snsDelay = 3600000UL / (aprsRprtHour * aprsMsrmMax);
-unsigned long snsNextTime = 0UL;  // The next time to read the sensors
-Adafruit_BMP280 atmo;             // The athmospheric sensor
-bool atmo_ok = false;             // The athmospheric sensor flag
-
-/*
-  Simple median filter
+/**
+  Simple median filter: get the median
   2014-03-25: started by David Cary
+
+  @param idx the index in round median array
+  @return the median
 */
-int mdnOut(int *buf) {
-  if (buf[0] < 3) return buf[3];
+int rMedOut(int idx) {
+  // Return the last value if the buffer is not full yet
+  if (rMed[idx][0] < 3) return rMed[idx][3];
   else {
-    int the_max = max(max(buf[1], buf[2]), buf[3]);
-    int the_min = min(min(buf[1], buf[2]), buf[3]);
-    // unnecessarily clever code
-    int the_median = the_max ^ the_min ^ buf[1] ^ buf[2] ^ buf[3];
-    return the_median;
+    // Get the maximum and the minimum
+    int the_max = max(max(rMed[idx][1], rMed[idx][2]), rMed[idx][3]);
+    int the_min = min(min(rMed[idx][1], rMed[idx][2]), rMed[idx][3]);
+    // Clever code: XOR the max and min, remaining the middle
+    return the_max ^ the_min ^ rMed[idx][1] ^ rMed[idx][2] ^ rMed[idx][3];
   }
 }
 
-void mdnIn(int *buf, int x) {
-  if (buf[0] < 3) buf[0]++;
-  buf[1] = buf[2];
-  buf[2] = buf[3];
-  buf[3] = x;
+/**
+  Simple median filter: add value to array
+
+  @param idx the index in round median array
+  @param x the value to add
+*/
+void rMedIn(int idx, int x) {
+  // At index 0 there is the number of values stored
+  if (rMed[idx][0] < 3) rMed[idx][0]++;
+  // Shift one position
+  rMed[idx][1] = rMed[idx][2];
+  rMed[idx][2] = rMed[idx][3];
+  rMed[idx][3] = x;
 }
 
+/**
+  Write the time to EEPROM, along with CRC32: 8 bytes
+
+  @param tm the time value to store
+*/
+void timeEEWrite(unsigned long utm) {
+  // Compute CRC32 checksum
+  CRC32 crc32;
+  crc32.update(&utm, sizeof(utm));
+  unsigned long crc = crc32.finalize();
+  // Write the data
+  EEPROM.put(eeTime, utm);
+  EEPROM.put(eeTime + sizeof(utm), crc);
+}
+
+/**
+  Read the time from EEPROM, along with CRC32 and verify
+*/
+unsigned long timeEERead() {
+  unsigned long utm, eck;
+  // Read the data
+  EEPROM.get(eeTime, utm);
+  EEPROM.get(eeTime + sizeof(utm), eck);
+  // Compute CRC32 checksum
+  CRC32 crc32;
+  crc32.update(&utm, sizeof(utm));
+  unsigned long crc = crc32.finalize();
+  // Verify
+  if (eck == crc) return utm;
+  else            return 0UL;
+}
+
+/**
+  Get current time as UNIX time (1970 epoch)
+
+  @param sync flag to show whether network sync is to be performed
+  @return current UNIX time
+*/
+unsigned long timeUNIX(bool sync = true) {
+  // Check if we need to sync
+  if (millis() >= timeNextSync and sync) {
+    // Try to get the time from Internet
+    unsigned long utm = timeSync();
+    if (utm == 0) {
+      // Time sync has failed, sync again over one minute
+      timeNextSync += 1UL * 60 * 1000;
+      timeOk = false;
+      // Try to get old time from eeprom, if time delta is zero
+      if (timeDelta == 0) {
+        // Compute an approximate time delta, if time is valid
+        utm = timeEERead();
+        if (utm != 0) {
+          timeDelta = utm - (millis() / 1000);
+          Serial.print(F("Time sync error, using EEPROM: 0x"));
+          Serial.println(utm, 16);
+        }
+        else Serial.println(F("Time sync error, invalid EEPROM"));
+      }
+    }
+    else {
+      // Compute the new time delta
+      timeDelta = utm - (millis() / 1000);
+      // Time sync has succeeded, sync again in 8 hours
+      timeNextSync += 8UL * 60 * 60 * 1000;
+      timeOk = true;
+      // Store this known time
+      timeEEWrite(utm);
+      Serial.print(F("Network UNIX Time: 0x"));
+      Serial.println(utm, 16);
+    }
+  }
+
+  // Get current time based on uptime and time delta,
+  // or just uptime for no time sync ever
+  return (millis() / 1000) + timeDelta;
+}
+
+/**
+  Connect to a time server using the RFC 868 time protocol
+
+  @return UNIX time from server
+*/
+unsigned long timeSync() {
+  union {
+    uint32_t t = 0UL;
+    uint8_t  b[4];
+  } uxtm;
+
+  // Try to connect
+  int bytes = sizeof(uxtm.b);
+  char timeServerBuf[strlen_P((char*)timeServer) + 1];
+  strncpy_P(timeServerBuf, (char*)timeServer, sizeof(timeServerBuf));
+  if (ethClient.connect(timeServerBuf, timePort)) {
+    // Read network time during 5 seconds
+    unsigned long timeout = millis() + 5000UL;
+    while (millis() <= timeout and bytes != 0) {
+      char b = ethClient.read();
+      if (b != -1) uxtm.b[--bytes] = uint8_t(b);
+    }
+    ethClient.stop();
+    // Keep the millis the connection worked
+    linkLastTime = millis();
+  }
+
+  // Convert 1900 epoch to 1970 Unix time, if read data is valid
+  if (!bytes) return (unsigned long)uxtm.t - 2208988800UL;
+  else        return 0UL;
+}
+
+/**
+  Send an APRS packet and, eventuall, print it to serial line
+
+  @param *pkt the packet to send
+*/
 void aprsSend(const char *pkt) {
 #ifdef DEBUG
   Serial.print(pkt);
 #endif
-  APRS_Client.print(pkt);
-}
-
-void aprsSend(const __FlashStringHelper *pkt) {
-#ifdef DEBUG
-  Serial.print(pkt);
-#endif
-  APRS_Client.print(pkt);
-}
-
-void aprsSendCRLF() {
-#ifdef DEBUG
-  Serial.print(F("\r\n"));
-#endif
-  APRS_Client.print(F("\r\n"));
-}
-
-void aprsSendHeader(const char *sep) {
-  aprsSend(aprsCallSign);
-  aprsSend(aprsPath);
-  aprsSend(sep);
+  //ethClient.write((uint8_t *)pkt, strlen(pkt));
+  ethClient.print(pkt);
 }
 
 /**
-  Return time in APRS format: DDHHMMz
+  Return time in zulu APRS format: HHMMSSh
+
+  @param *buf the buffer to return the time to
+  @param len the buffer length
 */
-char *aprsTime() {
-  time_t moment = now();
-  char buf[8];
-  sprintf_P(buf, PSTR("%02d%02d%02dz"), day(moment), hour(moment), minute(moment));
-  return buf;
+char aprsTime(char *buf, size_t len) {
+  // Get the time, but do not open a connection to server
+  unsigned long utm = timeUNIX(false);
+  // Compute hour, minute and second
+  int hh = (utm % 86400L) / 3600;
+  int mm = (utm % 3600) / 60;
+  int ss =  utm % 60;
+  // Return the formatted time
+  snprintf_P(buf, len, PSTR("%02d%02d%02dh"), hh, mm, ss);
 }
 
 /**
   Send APRS authentication data
-  user FW0690 pass -1 vers WxUno 0.2"
+  user FW0727 pass -1 vers WxUno 3.1"
 */
 void aprsAuthenticate() {
-  aprsSend(F("user "));
-  aprsSend(aprsCallSign);
-  aprsSend(F(" pass "));
-  aprsSend(aprsPassCode);
-  aprsSend(F(" vers "));
-  aprsSend(NODENAME);
-  aprsSend(F(" "));
-  aprsSend(VERSION);
-  aprsSendCRLF();
+  strcpy_P(aprsPkt, PSTR("user "));
+  strcat_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, PSTR(" pass "));
+  strcat_P(aprsPkt, aprsPassCode);
+  strcat_P(aprsPkt, PSTR(" vers "));
+  strcat_P(aprsPkt, NODENAME);
+  strcat_P(aprsPkt, PSTR(" "));
+  strcat_P(aprsPkt, VERSION);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
 }
 
 /**
   Send APRS weather data, then try to get the forecast
   FW0690>APRS,TCPIP*:@152457h4427.67N/02608.03E_.../...g...t044h86b10201L001WxUno
+  #ifdef DEBUG
+  Serial.print(pkt);
+  #endif
 
   @param temp temperature
   @param hmdt humidity
@@ -180,74 +338,76 @@ void aprsAuthenticate() {
   @param lux illuminance
 */
 void aprsSendWeather(int temp, int hmdt, int pres, int lux) {
-  aprsSendHeader("@");
-  // Compose the APRS packet
-  aprsSend(aprsTime());
-  aprsSend(aprsLocation);
-  // Wind
-  aprsSend(F(".../...g..."));
+  char buf[8];
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR("@"));
+  aprsTime(buf, sizeof(buf));
+  strncat(aprsPkt, buf, sizeof(buf));
+  strcat_P(aprsPkt, aprsLocation);
+  // Wind (unavailable)
+  strcat_P(aprsPkt, PSTR(".../...g..."));
   // Temperature
   if (temp >= -460) { // 0K in F
-    char buf[5];
     sprintf_P(buf, PSTR("t%03d"), temp);
-    aprsSend(buf);
+    strncat(aprsPkt, buf, sizeof(buf));
   }
   else {
-    aprsSend(F("t..."));
+    strcat_P(aprsPkt, PSTR("t..."));
   }
   // Humidity
   if (hmdt >= 0) {
     if (hmdt == 100) {
-      aprsSend(F("h00"));
+      strcat_P(aprsPkt, PSTR("h00"));
     }
     else {
-      char buf[5];
       sprintf_P(buf, PSTR("h%02d"), hmdt);
-      aprsSend(buf);
+      strncat(aprsPkt, buf, sizeof(buf));
     }
   }
   // Athmospheric pressure
   if (pres >= 0) {
-    char buf[7];
     sprintf_P(buf, PSTR("b%05d"), pres);
-    aprsSend(buf);
+    strncat(aprsPkt, buf, sizeof(buf));
   }
   // Illuminance, if valid
-  if (lux >= 0) {
-    char buf[5];
-    sprintf_P(buf, PSTR("L%03d"), (int)(lux * 0.0079));
-    aprsSend(buf);
+  if (lux >= 0 and lux <= 999) {
+    sprintf_P(buf, PSTR("L%03d"), lux);
+    strncat(aprsPkt, buf, sizeof(buf));
   }
   // Comment (device name)
-  aprsSend(NODENAME);
-  aprsSendCRLF();
+  strcat_P(aprsPkt, NODENAME);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
 }
 
 /**
   Send APRS telemetry and, periodically, send the telemetry setup
   FW0690>APRS,TCPIP*:T#517,173,062,213,002,000,00000000
 
+  @param a0 read analog A0
+  @param a1 read analog A1
+  @param rssi GSM RSSI level
   @param vcc voltage
-  @param rssi wifi level
-  @param heap free memory
-  @param luxVis raw visible illuminance
-  @param luxIrd raw infrared illuminance
-  @bits digital inputs
+  @param temp internal temperature
+  @param bits digital inputs
 */
-void aprsSendTelemetry(int a0, int a1, int a2, int vcc, int temp, byte bits) {
+void aprsSendTelemetry(int a0, int a1, int rssi, int vcc, int temp, byte bits) {
   // Increment the telemetry sequence number, reset it if exceeds 999
   if (++aprsTlmSeq > 999) aprsTlmSeq = 0;
-  // Send the telemetry setup on power up (first minutes) or if the sequence number is 0
-  if ((aprsTlmSeq == 0) or (millis() < snsDelay + snsDelay)) aprsSendTelemetrySetup();
+  // Send the telemetry setup if the sequence number is 0
+  if (aprsTlmSeq == 0) aprsSendTelemetrySetup();
   // Compose the APRS packet
-  aprsSendHeader("T");
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR("T"));
   char buf[40];
-  sprintf_P(buf, PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, a0, a1, a2, vcc, temp);
-  aprsSend(buf);
-  char bbuf[10];
-  itoa(bits, bbuf, 2);
-  aprsSend(bbuf);
-  aprsSendCRLF();
+  snprintf_P(buf, sizeof(buf), PSTR("#%03d,%03d,%03d,%03d,%03d,%03d,"), aprsTlmSeq, a0, a1, rssi, vcc, temp);
+  strncat(aprsPkt, buf, sizeof(buf));
+  itoa(bits, buf, 2);
+  strncat(aprsPkt, buf, sizeof(buf));
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
 }
 
 /**
@@ -255,35 +415,48 @@ void aprsSendTelemetry(int a0, int a1, int a2, int vcc, int temp, byte bits) {
 */
 void aprsSendTelemetrySetup() {
   char padCallSign[10];
-  sprintf_P(padCallSign, PSTR("%-9s"), aprsCallSign);
+  strcpy_P(padCallSign, aprsCallSign);  // Workaround
+  sprintf_P(padCallSign, PSTR("%-9s"), padCallSign);
   // Parameter names
-  aprsSendHeader(":");
-  aprsSend(padCallSign);
-  aprsSend(F(":PARM.Light,Thrm,A2,Vcc,Tmp,PROBE,ATMO,LUX,SAT,BAT,B6,B7,B8"));
-  aprsSendCRLF();
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR(":"));
+  strncat(aprsPkt, padCallSign, sizeof(padCallSign));
+  strcat_P(aprsPkt, aprsTlmPARM);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
   // Equations
-  aprsSendHeader(":");
-  aprsSend(padCallSign);
-  aprsSend(F(":EQNS.0,20,0,0,20,0,0,20,0,0,0.004,4.5,0,1,-100"));
-  aprsSendCRLF();
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR(":"));
+  strncat(aprsPkt, padCallSign, sizeof(padCallSign));
+  strcat_P(aprsPkt, aprsTlmEQNS);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
   // Units
-  aprsSendHeader(":");
-  aprsSend(padCallSign);
-  aprsSend(F(":UNIT.mV,mV,mV,V,C,prb,on,on,sat,low,N/A,N/A,N/A"));
-  aprsSendCRLF();
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR(":"));
+  strncat(aprsPkt, padCallSign, sizeof(padCallSign));
+  strcat_P(aprsPkt, aprsTlmUNIT);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
   // Bit sense and project name
-  aprsSendHeader(":");
-  aprsSend(padCallSign);
-  aprsSend(F(":BITS.10011111, "));
-  aprsSend(NODENAME);
-  aprsSend(F("/"));
-  aprsSend(VERSION);
-  aprsSendCRLF();
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR(":"));
+  strncat(aprsPkt, padCallSign, sizeof(padCallSign));
+  strcat_P(aprsPkt, aprsTlmBITS);
+  strcat_P(aprsPkt, NODENAME);
+  strcat_P(aprsPkt, PSTR("/"));
+  strcat_P(aprsPkt, VERSION);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
 }
 
 /**
   Send APRS status
-  FW0690>APRS,TCPIP*:>13:06 Fine weather
+  FW0690>APRS,TCPIP*:>Fine weather
 
   @param message the status message to send
 */
@@ -291,9 +464,12 @@ void aprsSendStatus(const char *message) {
   // Send only if the message is not empty
   if (message[0] != '\0') {
     // Send the APRS packet
-    aprsSendHeader(">");
-    aprsSend(message);
-    aprsSendCRLF();
+    strcpy_P(aprsPkt, aprsCallSign);
+    strcat_P(aprsPkt, aprsPath);
+    strcat_P(aprsPkt, PSTR(">"));
+    strcat(aprsPkt, message);
+    strcat_P(aprsPkt, eol);
+    aprsSend(aprsPkt);
   }
 }
 
@@ -303,16 +479,140 @@ void aprsSendStatus(const char *message) {
 
   @param comment the comment to append
 */
-void aprsSendPosition(const char *comment) {
+void aprsSendPosition(const char *comment = NULL) {
   // Compose the APRS packet
-  aprsSendHeader("!");
-  aprsSend(aprsLocation);
-  aprsSend(F("/000/000/A="));
+  strcpy_P(aprsPkt, aprsCallSign);
+  strcat_P(aprsPkt, aprsPath);
+  strcat_P(aprsPkt, PSTR("!"));
+  strcat_P(aprsPkt, aprsLocation);
+  strcat_P(aprsPkt, PSTR("/000/000/A="));
   char buf[7];
   sprintf_P(buf, PSTR("%06d"), altFeet);
-  aprsSend(buf);
-  aprsSend(comment);
-  aprsSendCRLF();
+  strncat(aprsPkt, buf, sizeof(buf));
+  if (comment != NULL) strcat(aprsPkt, comment);
+  strcat_P(aprsPkt, eol);
+  aprsSend(aprsPkt);
+}
+
+/**
+  Read the analog pin after a delay, while sleeping, using interrupt
+
+  @param pin the analog pin
+  @return raw analog read value
+*/
+int readAnalog(uint8_t pin) {
+  // Allow for channel or pin numbers
+  if (pin >= 14) pin -= 14;
+
+  // Set the analog reference to DEFAULT, select the channel (low 4 bits).
+  // This also sets ADLAR (left-adjust result) to 0 (the default).
+  ADMUX = _BV(REFS0) | (pin & 0x07);
+  ADCSRA |= _BV(ADPS0) | _BV(ADPS1) | _BV(ADPS2);  // prescaler of 128
+  ADCSRA |= _BV(ADEN);  // enable the ADC
+  ADCSRA |= _BV(ADIE);  // enable intterupt
+
+  // Wait for voltage to settle
+  delay(10);
+  // Take an ADC reading in sleep mode
+  noInterrupts();
+  // Start conversion
+  ADCSRA |= _BV(ADSC);
+  set_sleep_mode(SLEEP_MODE_ADC);
+  interrupts();
+
+  // Awake again, reading should be done, but better make sure
+  // maybe the timer interrupt fired
+  while (bit_is_set(ADCSRA, ADSC));
+
+  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
+  long wADC = ADCW;
+
+  // The returned reading
+  return (int)(wADC);
+}
+
+/**
+  Read the internal MCU temperature
+  The internal temperature has to be used with the internal reference of 1.1V.
+  Channel 8 can not be selected with the analogRead function yet.
+
+  @return temperature in hundreds of degrees Celsius, *calibrated for my device*
+*/
+int readMCUTemp() {
+  // Set the internal reference and mux.
+  ADMUX = (_BV(REFS1) | _BV(REFS0) | _BV(MUX3));
+  ADCSRA |= _BV(ADPS0) | _BV(ADPS1) | _BV(ADPS2);  // prescaler of 128
+  ADCSRA |= _BV(ADEN);  // enable the ADC
+  ADCSRA |= _BV(ADIE);  // enable intterupt
+
+  // Wait for voltage to settle
+  delay(10);
+  // Take an ADC reading in sleep mode
+  noInterrupts();
+  // Start conversion
+  ADCSRA |= _BV(ADSC);
+  set_sleep_mode(SLEEP_MODE_ADC);
+  interrupts();
+
+  // Awake again, reading should be done, but better make sure
+  // maybe the timer interrupt fired
+  while (bit_is_set(ADCSRA, ADSC));
+
+  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
+  long wADC = ADCW;
+
+  // The returned temperature is in hundreds degrees Celsius; calibrated
+  return (int)(84.87 * wADC - 25840);
+}
+
+/*
+  Read the power supply voltage, by measuring the internal 1V1 reference
+
+  @return voltage in millivolts, *calibrated for my device*
+*/
+int readVcc() {
+  // Set the reference to Vcc and the measurement to the internal 1.1V reference
+  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
+  ADCSRA |= _BV(ADPS0) | _BV(ADPS1) | _BV(ADPS2);  // prescaler of 128
+  ADCSRA |= _BV(ADEN);  // enable the ADC
+  ADCSRA |= _BV(ADIE);  // enable intterupt
+
+  // Wait for voltage to settle
+  delay(10);
+  // Take an ADC reading in sleep mode
+  noInterrupts();
+  // Start conversion
+  ADCSRA |= _BV(ADSC);
+  set_sleep_mode(SLEEP_MODE_ADC);
+  interrupts();
+
+  // Awake again, reading should be done, but better make sure
+  // maybe the timer interrupt fired
+  while (bit_is_set(ADCSRA, ADSC));
+
+  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
+  long wADC = ADCW;
+
+  // Return Vcc in mV; 1125300 = 1.1 * 1024 * 1000
+  // 1.1V calibration: 1.074
+  return (int)(1099776UL / wADC);
+}
+
+/**
+  Software reset the MCU
+  (c) Mircea Diaconescu http://web-engineering.info/node/29
+*/
+void softReset(uint8_t prescaller) {
+  Serial.print(F("Reboot"));
+  // Start watchdog with the provided prescaller
+  wdt_enable(prescaller);
+  // Wait for the prescaller time to expire
+  // without sending the reset signal by using
+  // the wdt_reset() method
+  while (true) {
+    Serial.print(F("."));
+    delay(1000);
+  }
 }
 
 time_t getUNIXTime() {
@@ -384,65 +684,50 @@ void sendNTPpacket() {
   UDP.endPacket();
 }
 
-int readMCUTemp() {
-  // The internal temperature has to be used
-  // with the internal reference of 1.1V.
-  // Channel 8 can not be selected with
-  // the analogRead function yet.
-
-  // Set the internal reference and mux.
-  ADMUX = (_BV(REFS1) | _BV(REFS0) | _BV(MUX3));
-  ADCSRA |= _BV(ADEN);  // enable the ADC
-
-  delay(10);                        // Wait for voltages to become stable.
-  ADCSRA |= _BV(ADSC);              // Start the ADC
-  while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
-
-  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
-  long wADC = ADCW;
-
-  // The returned temperature is in hundreds degrees Celsius; calibrated
-  return (int)(84.87 * wADC - 25840);
-}
-
-/*
-  Read the power supply voltage, by measuring the internal 1V1 reference
+/**
+  Check if the link failed for too long (3600 / aprsRprtHour) and reset
 */
-int readVcc() {
-  // Read 1.1V reference against AVcc
-  // set the reference to Vcc and the measurement to the internal 1.1V reference
-#if defined(__AVR_ATmega32U4__) || defined(__AVR_ATmega1280__) || defined(__AVR_ATmega2560__)
-  ADMUX = _BV(REFS0) | _BV(MUX4) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-#elif defined (__AVR_ATtiny24__) || defined(__AVR_ATtiny44__) || defined(__AVR_ATtiny84__)
-  ADMUX = _BV(MUX5) | _BV(MUX0);
-#elif defined (__AVR_ATtiny25__) || defined(__AVR_ATtiny45__) || defined(__AVR_ATtiny85__)
-  ADMUX = _BV(MUX3) | _BV(MUX2);
-#else
-  ADMUX = _BV(REFS0) | _BV(MUX3) | _BV(MUX2) | _BV(MUX1);
-#endif
-
-  delay(10);                        // Wait for Vref to settle
-  ADCSRA |= _BV(ADSC);              // Start conversion
-  while (bit_is_set(ADCSRA, ADSC)); // Detect end-of-conversion
-
-  // Reading register "ADCW" takes care of how to read ADCL and ADCH.
-  long wADC = ADCW;
-  // Return Vcc in mV; 1125300 = 1.1 * 1023 * 1000
-  // Calibration: 1.074
-  return (int)(1098702UL / wADC);
+void linkFailed() {
+  if (millis() >= linkLastTime + 3600000UL / aprsRprtHour) {
+    Serial.println(F("Connection failed for the last reports"));
+    // If time is good, store it
+    if (timeOk) timeEEWrite(timeUNIX(false));
+    // Reset the MCU (in 8s)
+    softReset(WDTO_8S);
+  }
 }
 
+/**
+  Print a character array from program memory
+*/
+void print_P(const char *str) {
+  uint8_t val;
+  do {
+    val = pgm_read_byte(str);
+    if (val) {
+      Serial.write(val);
+      str++;
+    }
+  } while (val);
+}
+
+/**
+  Main Arduino setup function
+*/
 void setup() {
   // Init the serial com
-  Serial.println();
   Serial.begin(9600);
-  Serial.println(NODENAME);
+  Serial.println();
+  print_P(NODENAME);
+  Serial.print(F(" "));
+  print_P(VERSION);
+  Serial.print(F(" "));
   Serial.println(__DATE__);
 
   // Start the Ethernet connection:
-  if (Ethernet.begin(mac) == 0) {
+  if (ethDHCP = Ethernet.begin(ethMAC) == 0) {
     Serial.println(F("Failed to configure Ethernet using DHCP"));
-    Ethernet.begin(mac, ip);
+    Ethernet.begin(ethMAC, ethIP, ethDNS, ethGW, ethMSK);
   }
   // Print the Ethernet shield's IP address:
   Serial.print(F("IP address: "));
@@ -451,41 +736,71 @@ void setup() {
   delay(1000);
 
   // Start time sync
-  UDP.begin(ntpLocalPort);
+  timeUNIX();
+  //UDP.begin(ntpLocalPort);
   //setSyncProvider(getNtpTime);
-  setSyncProvider(getUNIXTime);
-  setSyncInterval(60 * 60);
+  //setSyncProvider(getUNIXTime);
+  //setSyncInterval(60 * 60);
 
   // BMP280
-  if (atmo.begin(0x76)) {
-    atmo_ok = true;
-    Serial.println(F("BMP280 sensor detected."));
-  }
-  else {
-    atmo_ok = false;
-    Serial.println(F("BMP280 sensor missing."));
-  }
+  atmo_ok = atmo.begin(0x76);
+  if (atmo_ok) Serial.println(F("BMP280 sensor detected"));
+  else         Serial.println(F("BMP280 sensor missing"));
 
+  // BH1750
+  light.begin(BH1750_CONTINUOUS_HIGH_RES_MODE);
+  uint16_t lux = light.readLightLevel();
+  light_ok = true;
+
+  // Hardware data
+  int hwTemp = readMCUTemp();
+  int hwVcc  = readVcc();
+  Serial.print(F("Temp: "));
+  Serial.println(hwTemp);
+  Serial.print(F("Vcc : "));
+  Serial.println(hwVcc);
+ 
   // Initialize the random number generator and set the APRS telemetry start sequence
-  if (timeStatus() != timeNotSet) randomSeed(now());
-  else                            randomSeed(readMCUTemp());
+  randomSeed(hwTemp + timeUNIX(false) + hwVcc + millis());
   aprsTlmSeq = random(1000);
+  Serial.print(F("TLM : "));
+  Serial.println(aprsTlmSeq);
 
   // Start the sensor timer
   snsNextTime = millis();
+
+  // Enable the watchdog
+  wdt_enable(WDTO_8S);
 }
 
+/**
+  Main Arduino loop
+*/
 void loop() {
-  // Read the sensors and publish telemetry
+  // Read the sensors
   if (millis() >= snsNextTime) {
-    // Keep the time
-    now();
-    // Check the DHCP lease
-    Ethernet.maintain();
+    // Check the DHCP lease, if using DHCP
+    if (ethDHCP) Ethernet.maintain();
     // Count to check if we need to send the APRS data
-    if (++aprsMsrmCount > aprsMsrmMax) aprsMsrmCount = 1;
+    if (++aprsMsrmCount >= aprsMsrmMax) {
+      // Restart the counter
+      aprsMsrmCount = 0;
+      // Repeat sensor reading after the 'before' delay (long)
+      snsNextTime += snsDelayBfr;
+    }
+    else {
+      // Repeat sensor reading after the 'between' delay (short)
+      snsNextTime += snsDelayBtw;
+    }
     // Set the telemetry bit 7 if the station is being probed
     if (PROBE) aprsTlmBits = B10000000;
+
+    // Check the time and set the telemetry bit 2 if time is not accurate
+    unsigned long utm = timeUNIX();
+    if (!timeOk) aprsTlmBits |= B00000100;
+
+    // Set the telemetry bit 1 if the uptime is less than one day (recent reboot)
+    if (millis() < 86400000UL) aprsTlmBits |= B00000010;
 
     // Read BMP280
     float temp, pres;
@@ -495,57 +810,84 @@ void loop() {
       // Get the weather parameters
       temp = atmo.readTemperature();
       pres = atmo.readPressure();
-      // Median Filter
-      mdnIn(rmTemp, (int)(temp * 9 / 5 + 32));      // Store directly integer Fahrenheit
-      mdnIn(rmPres, (int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
+      // Add to the round median filter
+      rMedIn(MD_TEMP, (int)(temp * 9 / 5 + 32));      // Store directly integer Fahrenheit
+      rMedIn(MD_PRES, (int)(pres * altCorr / 10.0));  // Store directly sea level in dPa
     }
 
-    // Read Vcc first (mV)
+    // Read BH1750, illuminance value in lux
+    uint16_t lux = light.readLightLevel();
+    // Calculate the solar radiation in W/m^2
+    // FIXME this is in cW/m^2
+    int solRad = (int)(lux * 0.79);
+    // Set the bit 5 to show the sensor is present (reverse) and there is any light
+    if (solRad > 0) aprsTlmBits |= B00100000;
+    // Set the bit 4 to show the sensor is saturated
+    if (solRad > 999) aprsTlmBits |= B00010000;
+    // Add to round median filter
+    rMedIn(MD_SRAD, solRad);
+
+    // Read Vcc (mV) and add to the round median filter
     int vcc = readVcc();
-    if (vcc < 5000) {
-      // Set the bit 3 to show the battery is low
+    rMedIn(MD_VCC, vcc);
+    if (vcc < 4750 or vcc > 5250) {
+      // Set the bit 3 to show the USB voltage is wrong (5V +/- 5%)
       aprsTlmBits |= B00001000;
     }
 
-    // Various telemetry
-    int a0 = analogRead(A0);
-    int a1 = analogRead(A1);
-    int a2 = analogRead(A2);
+    // Various analog telemetry
+    int a0 = readAnalog(A0);
+    int a1 = readAnalog(A1);
 
-    // Median Filter
-    mdnIn(rmA0, ((unsigned long)vcc * (1023UL - (unsigned long)a0)) / 20480);
-    mdnIn(rmA1, ((unsigned long)vcc * (unsigned long)a1) / 20480);
-    mdnIn(rmA2, ((unsigned long)vcc * (unsigned long)a2) / 20480);
+    // Add to round median filter, mV (a / 1024 * Vcc)
+    rMedIn(MD_A0, (vcc * (unsigned long)a0) / 1024);
+    rMedIn(MD_A1, (vcc * (unsigned long)a1) / 1024);
 
     // Upper part
-    // 500 / R(kO); R = R0(1023/x-1)
+    // 500 / R(kO); R = R0(1024 / x - 1)
     // Lower part
     // Vout=RawADC0*0.0048828125;
     // lux=(2500/Vout-500)/10;
-    
     //int lux = 51150L / a0 - 50;
-    int lux = (2500 * 5 / 1023 / a0 - 500) / 10;
 
     // APRS (after the first 3600/(aprsMsrmMax*aprsRprtHour) seconds,
     //       then every 60/aprsRprtHour minutes)
-    if (aprsMsrmCount == 1) {
-      if (APRS_Client.connect(aprsServer, aprsPort)) {
-        Serial.print(F("Connected to "));
-        Serial.println(aprsServer);
+    if (aprsMsrmCount == 0) {
+      // Reset the watchdog
+      wdt_reset();
+      // Get RSSI (will get FALSE (0) if the modem is not working)
+      // FIXME
+      int rssi = 0;
+      if (rssi) rMedIn(MD_RSSI, -rssi);
+      // Connect to APRS server
+      char aprsServerBuf[strlen_P((char*)aprsServer) + 1];
+      strncpy_P(aprsServerBuf, (char*)aprsServer, sizeof(aprsServerBuf));
+      if (ethClient.connect(aprsServerBuf, aprsPort)) {
+        // Reset the watchdog
+        wdt_reset();
+        // Authentication
         aprsAuthenticate();
-        //aprsSendPosition(" WxUnoProbe");
-        if (atmo_ok) aprsSendWeather(mdnOut(rmTemp), -1, mdnOut(rmPres), lux);
-        //aprsSendWeather(rmTemp.out(), -1, -1, -1);
-        aprsSendTelemetry(mdnOut(rmA0), mdnOut(rmA1), mdnOut(rmA2), (vcc - 4500) / 4, readMCUTemp() / 100 + 100, aprsTlmBits);
+        // Send the position, altitude and comment in firsts minutes after boot
+        if (millis() < snsDelayBfr) aprsSendPosition();
+        // Send weather data if the athmospheric sensor is present
+        if (atmo_ok) aprsSendWeather(rMedOut(MD_TEMP), -1, rMedOut(MD_PRES), rMedOut(MD_SRAD));
+        // Send the telemetry
+        aprsSendTelemetry(rMedOut(MD_A0) / 20,
+                          rMedOut(MD_A1) / 20,
+                          rMedOut(MD_RSSI),
+                          (rMedOut(MD_VCC) - 4500) / 4,
+                          readMCUTemp() / 100 + 100,
+                          aprsTlmBits);
         //aprsSendStatus("Fine weather");
-        //aprsSendTelemetrySetup();
-        APRS_Client.stop();
-        Serial.println(F("Disconnected."));
+        // Close the connection
+        ethClient.stop();
+        // Keep the millis the connection worked
+        linkLastTime = millis();
       }
-      else Serial.println(F("Connection failed"));
+      else linkFailed();
     }
-
-    // Repeat sensor reading
-    snsNextTime += snsDelay;
   }
+
+  // Reset the watchdog
+  wdt_reset();
 }
