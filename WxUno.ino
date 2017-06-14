@@ -47,12 +47,9 @@
 #include <Ethernet.h>
 #include <EthernetUdp.h>
 
-// NTP
-#include <TimeLib.h>
-
 // Device name and software version
 const char NODENAME[] PROGMEM = "WxUno";
-const char VERSION[]  PROGMEM = "3.0";
+const char VERSION[]  PROGMEM = "3.1";
 bool       PROBE              = true;                   // True if the station is being probed
 
 // APRS parameters
@@ -84,6 +81,7 @@ const int     timePort              = 37;                      // Time server po
 unsigned long timeNextSync          = 0UL;                     // Next time to syncronize
 unsigned long timeDelta             = 0UL;                     // Difference between real time and internal clock
 bool          timeOk                = false;                   // Flag to know the time is accurate
+const int     timeZone              = 0;                       // Time zone
 const int     eeTime                = 0;                       // EEPROM address for storing last known good time
 
 // Reports and measurements
@@ -106,7 +104,6 @@ bool       ethDHCP = false;
 
 // The APRS connection client
 EthernetClient  ethClient;
-EthernetClient  TIME_Client;
 unsigned long   linkLastTime = 0UL;             // Last connection time
 
 // When ADC completed, take an interrupt
@@ -128,12 +125,9 @@ BH1750              light(0x23);                                          // The
 bool                light_ok = false;                                     // The illuminance sensor presence flag
 
 // NTP
-const int   TZ = 0;
-const char *NTP_SERVER = "europe.pool.ntp.org";
-const int   NTP_PACKET_SIZE = 48;
-byte packetBuffer[NTP_PACKET_SIZE];
-unsigned int ntpLocalPort = 8888;
-EthernetUDP UDP;
+const char  ntpServer[] PROGMEM = "europe.pool.ntp.org";  // NTP server to connect to (RFC5905)
+const int   ntpPort = 123;                                // NTP port
+EthernetUDP ethNTP;                                       // NTP UDP client
 
 /**
   Simple median filter: get the median
@@ -211,7 +205,7 @@ unsigned long timeUNIX(bool sync = true) {
   // Check if we need to sync
   if (millis() >= timeNextSync and sync) {
     // Try to get the time from Internet
-    unsigned long utm = timeSync();
+    unsigned long utm = ntpSync(); //timeSync();
     if (utm == 0) {
       // Time sync has failed, sync again over one minute
       timeNextSync += 1UL * 60 * 1000;
@@ -279,6 +273,61 @@ unsigned long timeSync() {
 }
 
 /**
+  © Francesco Potortì 2013 - GPLv3 - Revision: 1.13
+
+  Send an NTP packet and wait for the response, return the Unix time
+
+  To lower the memory footprint, no buffers are allocated for sending
+  and receiving the NTP packets.  Four bytes of memory are allocated
+  for transmision, the rest is random garbage collected from the data
+  memory segment, and the received packet is read one byte at a time.
+  The Unix time is returned, that is, seconds from 1970-01-01T00:00.
+*/
+unsigned long ntpSync() {
+  // Open socket on arbitrary port
+  bool ntpOk = ethNTP.begin(12321);
+  // NTP request header: Only the first four bytes of an outgoing
+  // packet need to be set appropriately, the rest can be whatever.
+  const long ntpFirstFourBytes = 0xEC0600E3;
+  // Fail if UDP could not init a socket
+  if (!ntpOk) return 0UL;
+  // Clear received data from possible stray received packets
+  ethNTP.flush();
+  // Send an NTP request
+  char ntpServerBuf[strlen_P((char*)ntpServer) + 1];
+  strncpy_P(ntpServerBuf, (char*)ntpServer, sizeof(ntpServerBuf));
+  if (!(ethNTP.beginPacket(ntpServerBuf, ntpPort) &&
+        ethNTP.write((byte *)&ntpFirstFourBytes, 48) == 48 &&
+        ethNTP.endPacket()))
+    return 0UL;                         // sending request failed
+  // Wait for response; check every pollIntv ms up to maxPoll times
+  const int pollIntv = 150;             // poll every this many ms
+  const byte maxPoll = 15;              // poll up to this many times
+  int pktLen;                           // received packet length
+  for (byte i = 0; i < maxPoll; i++) {
+    if ((pktLen = ethNTP.parsePacket()) == 48) break;
+    delay(pollIntv);
+  }
+  if (pktLen != 48) return 0UL;         // no correct packet received
+  // Read and discard the first useless bytes (32 for speed, 40 for accuracy)
+  for (byte i = 0; i < 40; ++i) ethNTP.read();
+  // Read the integer part of sending time
+  unsigned long ntpTime = ethNTP.read();  // NTP time
+  for (byte i = 1; i < 4; i++)
+    ntpTime = ntpTime << 8 | ethNTP.read();
+  // Round to the nearest second if we want accuracy
+  // The fractionary part is the next byte divided by 256: if it is
+  // greater than 500ms we round to the next second; we also account
+  // for an assumed network delay of 50ms, and (0.5-0.05)*256=115;
+  // additionally, we account for how much we delayed reading the packet
+  // since its arrival, which we assume on average to be pollIntv/2.
+  ntpTime += (ethNTP.read() > 115 - pollIntv / 8);
+  // Discard the rest of the packet
+  ethNTP.flush();
+  return ntpTime - 2208988800UL;          // convert to Unix time
+}
+
+/**
   Send an APRS packet and, eventuall, print it to serial line
 
   @param *pkt the packet to send
@@ -287,7 +336,6 @@ void aprsSend(const char *pkt) {
 #ifdef DEBUG
   Serial.print(pkt);
 #endif
-  //ethClient.write((uint8_t *)pkt, strlen(pkt));
   ethClient.print(pkt);
 }
 
@@ -536,7 +584,7 @@ int readAnalog(uint8_t pin) {
   The internal temperature has to be used with the internal reference of 1.1V.
   Channel 8 can not be selected with the analogRead function yet.
 
-  @return temperature in hundreds of degrees Celsius, *calibrated for my device*
+  @return temperature in hundredth of degrees Celsius, *calibrated for my device*
 */
 int readMCUTemp() {
   // Set the internal reference and mux.
@@ -615,75 +663,6 @@ void softReset(uint8_t prescaller) {
   }
 }
 
-time_t getUNIXTime() {
-  union {
-    uint32_t t = 0UL;
-    uint8_t  b[4];
-  } uxtm;
-  int i = 3;
-  if (TIME_Client.connect("utcnist.colorado.edu", 37)) {
-    unsigned int timeout = millis() + 10000UL;   // 10 seconds timeout
-    while (millis() <= timeout and i >= 0) {
-      if (TIME_Client.available()) uxtm.b[i--] = TIME_Client.read();
-    }
-    TIME_Client.stop();
-  }
-  if (i < 0) {
-    uint32_t tm = uxtm.t - 2208988800UL + TZ * SECS_PER_HOUR;
-    Serial.print(F("Time sync: "));
-    Serial.println(tm);
-    return tm;
-  }
-  else {
-    Serial.println(F("Time sync error"));
-    return 0;
-  }
-}
-
-time_t getNtpTime() {
-  while (UDP.parsePacket() > 0) ; // discard any previously received packets
-  sendNTPpacket();
-  uint32_t beginWait = millis();
-  while (millis() - beginWait < 1500) {
-    int size = UDP.parsePacket();
-    if (size >= NTP_PACKET_SIZE) {
-      Serial.println(F("NTP sync"));
-      UDP.read(packetBuffer, NTP_PACKET_SIZE);  // read packet into the buffer
-      unsigned long secsSince1900;
-      // convert four bytes starting at location 40 to a long integer
-      secsSince1900 =  (unsigned long)packetBuffer[40] << 24;
-      secsSince1900 |= (unsigned long)packetBuffer[41] << 16;
-      secsSince1900 |= (unsigned long)packetBuffer[42] << 8;
-      secsSince1900 |= (unsigned long)packetBuffer[43];
-      return secsSince1900 - 2208988800UL + TZ * SECS_PER_HOUR;
-    }
-  }
-  Serial.println(F("No NTP sync"));
-  return 0; // return 0 if unable to get the time
-}
-
-// send an NTP request to the time server at the given address
-void sendNTPpacket() {
-  // set all bytes in the buffer to 0
-  memset(packetBuffer, 0, NTP_PACKET_SIZE);
-  // Initialize values needed to form NTP request
-  // (see URL above for details on the packets)
-  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
-  packetBuffer[1] = 0;     // Stratum, or type of clock
-  packetBuffer[2] = 6;     // Polling Interval
-  packetBuffer[3] = 0xEC;  // Peer Clock Precision
-  // 8 bytes of zero for Root Delay & Root Dispersion
-  packetBuffer[12]  = 49;
-  packetBuffer[13]  = 0x4E;
-  packetBuffer[14]  = 49;
-  packetBuffer[15]  = 52;
-  // all NTP fields have been given values, now
-  // you can send a packet requesting a timestamp:
-  UDP.beginPacket(NTP_SERVER, 123); //NTP requests are to port 123
-  UDP.write(packetBuffer, NTP_PACKET_SIZE);
-  UDP.endPacket();
-}
-
 /**
   Check if the link failed for too long (3600 / aprsRprtHour) and reset
 */
@@ -703,11 +682,8 @@ void linkFailed() {
 void print_P(const char *str) {
   uint8_t val;
   do {
-    val = pgm_read_byte(str);
-    if (val) {
-      Serial.write(val);
-      str++;
-    }
+    val = pgm_read_byte(str++);
+    if (val) Serial.write(val);
   } while (val);
 }
 
@@ -737,10 +713,6 @@ void setup() {
 
   // Start time sync
   timeUNIX();
-  //UDP.begin(ntpLocalPort);
-  //setSyncProvider(getNtpTime);
-  //setSyncProvider(getUNIXTime);
-  //setSyncInterval(60 * 60);
 
   // BMP280
   atmo_ok = atmo.begin(0x76);
@@ -756,10 +728,10 @@ void setup() {
   int hwTemp = readMCUTemp();
   int hwVcc  = readVcc();
   Serial.print(F("Temp: "));
-  Serial.println(hwTemp);
+  Serial.println((float)hwTemp / 100, 2);
   Serial.print(F("Vcc : "));
-  Serial.println(hwVcc);
- 
+  Serial.println((float)hwVcc / 1000, 3);
+
   // Initialize the random number generator and set the APRS telemetry start sequence
   randomSeed(hwTemp + timeUNIX(false) + hwVcc + millis());
   aprsTlmSeq = random(1000);
